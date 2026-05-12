@@ -1,0 +1,19 @@
+[package]
+name = "mime-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+color-eyre = "0.6.5"
+crossterm = "0.29.0"
+dirs = "6.0.0"
+eyre = "0.6.12"
+fuzzy-matcher = "0.3.7"
+nerd-font-symbols = "0.3.0"
+once_cell = "1.21.4"
+serde = { version = "1.0.228", features = ["derive"] }
+tui-input = { version = "0.15.3", default-features = false, features = ["crossterm"] }
+ratatui = "0.30.0"
+toml = "1.1"
+rusqlite = { version = "0.39", features = ["bundled"] }
+quick-xml = "0.39"

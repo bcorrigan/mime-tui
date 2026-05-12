@@ -1,0 +1,207 @@
+//! Lookup of human-readable descriptions for MIME types via the
+//! shared-mime-info database. We look in `<datadir>/mime/<media>/<subtype>.xml`
+//! across XDG data dirs and pull out the default-locale `<comment>` element.
+//!
+//! Results are cached in SQLite keyed by the mime id, with the source path's
+//! mtime as the freshness check. Missing types yield an empty description so
+//! the UI can fall back to the mime id itself.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use eyre::Result;
+use quick_xml::Reader;
+use quick_xml::events::Event;
+use rusqlite::{Connection, params};
+
+fn mime_data_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    if let Some(h) = dirs::data_dir() {
+        out.push(h.join("mime"));
+    }
+
+    let data_dirs = std::env::var("XDG_DATA_DIRS").ok().filter(|s| !s.is_empty());
+    match data_dirs {
+        Some(dirs) => {
+            for d in dirs.split(':') {
+                if !d.is_empty() {
+                    out.push(PathBuf::from(d).join("mime"));
+                }
+            }
+        }
+        None => {
+            out.push(PathBuf::from("/usr/local/share/mime"));
+            out.push(PathBuf::from("/usr/share/mime"));
+        }
+    }
+
+    out
+}
+
+/// Find the shared-mime-info XML for a mime id (`media/subtype` → `<datadir>/mime/media/subtype.xml`).
+/// Returns the highest-priority path that exists.
+fn find_xml(dirs: &[PathBuf], mime: &str) -> Option<PathBuf> {
+    let (media, subtype) = mime.split_once('/')?;
+    if media.is_empty() || subtype.is_empty() {
+        return None;
+    }
+    // Defensive: reject path traversal in mime ids.
+    if media.contains("..") || subtype.contains("..") || media.contains('/') {
+        return None;
+    }
+    for d in dirs {
+        let p = d.join(media).join(format!("{}.xml", subtype));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn mtime_secs(p: &Path) -> i64 {
+    fs::metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse the default-locale `<comment>` (the one without `xml:lang`) out of a
+/// shared-mime-info XML file.
+fn parse_comment(path: &Path) -> Option<String> {
+    let mut reader = Reader::from_file(path).ok()?;
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut depth = 0i32;
+    let mut in_default_comment = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Err(_) => return None,
+            Ok(Event::Eof) => return None,
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                if depth == 2 && e.name().as_ref() == b"comment" {
+                    let has_lang = e.attributes().any(|a| {
+                        a.map(|a| a.key.as_ref() == b"xml:lang").unwrap_or(false)
+                    });
+                    if !has_lang {
+                        in_default_comment = true;
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                if in_default_comment {
+                    // We exited the comment we cared about without finding text.
+                    return Some(String::new());
+                }
+                depth -= 1;
+            }
+            Ok(Event::Text(t)) => {
+                if in_default_comment {
+                    return t.decode().ok().map(|c| c.to_string());
+                }
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+/// For each mime id, ensure the cache has an up-to-date description. Uses the
+/// source XML's mtime as the freshness signal; mimes with no XML get an empty
+/// description recorded (so we don't re-scan every run).
+pub fn refresh_descriptions(conn: &mut Connection, mime_ids: &[String]) -> Result<()> {
+    let dirs = mime_data_dirs();
+    let tx = conn.transaction()?;
+    for mime in mime_ids {
+        let path = find_xml(&dirs, mime);
+        let (path_str, file_mtime) = match &path {
+            Some(p) => (p.to_string_lossy().into_owned(), mtime_secs(p)),
+            None => (String::new(), 0),
+        };
+
+        let cached: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT source_path, file_mtime FROM mime_types WHERE id = ?",
+                params![mime],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        if let Some((cached_path, cached_mtime)) = cached {
+            if cached_path == path_str && cached_mtime == file_mtime {
+                continue;
+            }
+        }
+
+        let desc = path.as_deref().and_then(parse_comment).unwrap_or_default();
+        tx.execute(
+            "INSERT OR REPLACE INTO mime_types(id, description, source_path, file_mtime)
+             VALUES (?, ?, ?, ?)",
+            params![mime, desc, path_str, file_mtime],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn load_descriptions(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT id, description FROM mime_types")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for r in rows {
+        let (id, desc) = r?;
+        out.insert(id, desc);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tempdir(prefix: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{}_{}_{}", prefix, pid, nanos));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parses_default_comment() {
+        let dir = tempdir("mime_tui_xml");
+        let media = dir.join("text");
+        fs::create_dir_all(&media).unwrap();
+        let xml = media.join("html.xml");
+        fs::write(
+            &xml,
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info" type="text/html">
+  <comment>HTML document</comment>
+  <comment xml:lang="de">HTML-Dokument</comment>
+</mime-type>"#,
+        )
+        .unwrap();
+        assert_eq!(parse_comment(&xml).as_deref(), Some("HTML document"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_xml_rejects_traversal() {
+        let dirs = vec![PathBuf::from("/usr/share/mime")];
+        assert!(find_xml(&dirs, "../etc/passwd").is_none());
+        assert!(find_xml(&dirs, "text/").is_none());
+        assert!(find_xml(&dirs, "/html").is_none());
+    }
+}
