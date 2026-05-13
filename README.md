@@ -1,10 +1,14 @@
 # mime-tui
 
-A keyboard-driven terminal UI for managing the MIME-type → application
-associations that file managers and `xdg-open` consult on Linux. The same
-defaults you would otherwise edit through GNOME Settings, KDE System
-Settings, or by hand in `~/.config/mimeapps.list` — only this one loads
-fast, runs in any terminal, and behaves identically on every desktop.
+A keyboard-driven terminal UI for managing the MIME-type->application
+associations that file managers and `xdg-open` consult on linux. 
+
+If you use a window manager on linux and not a full blown desktop environment like KDE, Gnome or XFCE - you still want to manage MIME type associations. Lots of people achieve this by using the XFCE mime type manager which is mostly-independent of the rest of XFCE, but with the recent resurgance in TUI interfaces I thought it would be very nice to have a fast and efficient TUI for managing mime type associations in a keyboard-centric way.
+
+As you probably don't intend to use a mime editor every day, it is focussed on being easy to use and well prompted with keyboard help. You should be able to launch it to edit something once or twice every 6 months - and be able to use it easily.
+
+mime-tui only updates `~/.config/mimeapps.list` - so it may not interact well with Gnome and KDE where they have "override" files where they preferentially look for mime associations over and above the mimeapps.list. mime-tui is probably best suited for users of Sway, Hyprland, and so on as a result.
+
 
 <p align="center">
   <img src="bymime.png" alt="By-mime view" width="49%"/>
@@ -12,15 +16,15 @@ fast, runs in any terminal, and behaves identically on every desktop.
 </p>
 
 <p align="center">
-  <sub><b>Left:</b> browsing MIME types, filtered to <code>csv</code> — the right pane shows the resolved default and full associations list for the selected type. &nbsp;
-  <b>Right:</b> the by-app view with the multi-toggle picker open over it, set up to associate several <code>text/*</code> types with Emacs in one keystroke.</sub>
+  <sub><b>Left:</b> browsing MIME types, filtered to <code>text</code> — the right pane shows the resolved default and full associations list for the selected type. &nbsp;
+  <b>Right:</b> the by-app view with the multi-toggle picker open over it</sub>
 </p>
 
 ## Features
 
 - **Two browse modes.** `Tab` between "by MIME type" (which apps handle
   this?) and "by application" (which mimes does this app handle?).
-- **Live fuzzy search.** Type to filter the left list — prefix matches
+- **Live fuzzy search.** Type to filter the left list. Prefix matches
   rank above fuzzy hits.
 - **Inline edits with live preview.** `d` set default, `r` remove, `c`
   clear default, `a` open picker. Edits accumulate in memory and the UI
@@ -34,9 +38,9 @@ fast, runs in any terminal, and behaves identically on every desktop.
 - **Atomic save.** Writes a tempfile then renames, with a rolling `.bak`.
   After a successful save, runs `update-desktop-database` best-effort so
   other apps see your edit without a logout/login.
-- **XDG-correct read.** Walks the full priority chain — per-desktop
+- **XDG-correct read.** Walks the full priority chain - per-desktop
   overrides (`gnome-mimeapps.list`, etc.), `$XDG_CONFIG_DIRS`, and the
-  deprecated locations under `$XDG_DATA_DIRS` — and resolves them per
+  deprecated locations under `$XDG_DATA_DIRS` - and resolves them per
   spec.
 - **Override-aware.** When a default came from a higher-priority file,
   the detail pane shows where it lives, and a save that would be silently
@@ -47,7 +51,7 @@ fast, runs in any terminal, and behaves identically on every desktop.
 - **Fast startup.** `.desktop` files are parsed once and cached in
   SQLite; subsequent runs do mtime-only checks and start in milliseconds.
 - **Themable.** Colors, borders, cursor shape, etc. via an optional
-  TOML config — every field falls back to a built-in default.
+  TOML config. Every field falls back to a built-in default.
 - **Mouse supported.** Click to select, scroll-wheel to navigate.
 
 ## Install
@@ -87,7 +91,7 @@ Press **`?`** at any time for the full reference. The most useful ones:
 ## Configuration
 
 `mime-tui` looks for `~/.config/mime-tui/mime-tui.toml`. Every field is
-optional — anything you don't set keeps its default.
+optional - all fields & their default values listed below.
 
 ```toml
 search_position = "top"     # or "bottom"
@@ -104,8 +108,8 @@ cursor_shape  = "block"     # block | underline | pipe
 
 ## Files written
 
-- `$XDG_CONFIG_HOME/mimeapps.list` — the only file ever written, plus a
+- `$XDG_CONFIG_HOME/mimeapps.list` - this is the only file ever written, plus a
   rolling `.bak` alongside.
-- `$XDG_DATA_HOME/mime-tui/mime-tui.sqlite` — a parse cache for installed
+- `$XDG_DATA_HOME/mime-tui/mime-tui.sqlite` - a parse cache for installed
   `.desktop` files and shared-mime-info descriptions. Purely a speed
-  optimisation; safe to delete at any time.
+  optimisation and safe to delete at any time.
