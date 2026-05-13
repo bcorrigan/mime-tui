@@ -28,7 +28,9 @@ fn source_label(app: &App, mime_id: &str) -> Option<String> {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
-    let (left_area, right_area) = layout::horizontal_split(area);
+    // Mime ids can be very long (e.g. "application/vnd.oasis.opendocument…"),
+    // so give the left list 60% of the width.
+    let (left_area, right_area) = layout::horizontal_split(area, 60);
 
     let visible: Vec<crate::model::MimeType> =
         app.visible_mimes().into_iter().cloned().collect();
@@ -36,19 +38,39 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
         .iter()
         .map(|m| format!("{}  {}", icons::mime_icon(&m.id), m.id))
         .collect();
-    let clamped_left = app.selected_left.min(display.len().saturating_sub(1));
+
+    // Compute max content width for hscroll/scrollbar — long mime ids spill
+    // off the right edge of the pane on smaller terminals.
+    let max_content_w: usize = display.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    // `render_list` adds " {item} " padding (1 col each side) inside a
+    // bordered block — so usable content width = area.width - 4.
+    let inner_w = (left_area.width as usize).saturating_sub(4);
+    let hscroll = (app.left_hscroll as usize).min(max_content_w.saturating_sub(inner_w));
+    app.left_hscroll = hscroll as u16;
+
+    let scrolled: Vec<String> = if hscroll == 0 {
+        display.clone()
+    } else {
+        display
+            .iter()
+            .map(|s| s.chars().skip(hscroll).collect::<String>())
+            .collect()
+    };
+
+    let clamped_left = app.selected_left.min(scrolled.len().saturating_sub(1));
     let focus_left = app.focus == Focus::Left;
 
     layout::render_list(
         f,
         left_area,
         " MIME types ",
-        &display,
+        &scrolled,
         Some(clamped_left),
         focus_left,
         config,
         &mut app.left_list_state,
     );
+    layout::render_list_hscrollbar(f, left_area, max_content_w, hscroll, config);
     app.left_rect = Some(left_area);
 
     let selected_mime = visible.get(clamped_left).cloned();
@@ -174,8 +196,24 @@ fn render_associations(
         })
         .collect();
 
+    // Associations are usually app names (short), but a verbose
+    // "(default)" suffix can still overflow on narrow panes.
+    let max_content_w: usize = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let inner_w = (area.width as usize).saturating_sub(4);
+    let hscroll = (app.right_hscroll as usize).min(max_content_w.saturating_sub(inner_w));
+    app.right_hscroll = hscroll as u16;
+
+    let scrolled: Vec<String> = if hscroll == 0 {
+        items
+    } else {
+        items
+            .iter()
+            .map(|s| s.chars().skip(hscroll).collect::<String>())
+            .collect()
+    };
+
     let focus_right = app.focus == Focus::Right;
-    let clamped = app.selected_right.min(items.len().saturating_sub(1));
+    let clamped = app.selected_right.min(scrolled.len().saturating_sub(1));
     // Only show the selection bar when the right pane is focused. With focus
     // on the left, the right pane is just informational — a "ghost" selection
     // here would imply navigability that isn't actually active.
@@ -184,10 +222,11 @@ fn render_associations(
         f,
         area,
         " Associations ",
-        &items,
+        &scrolled,
         selected,
         focus_right,
         config,
         &mut app.right_list_state,
     );
+    layout::render_list_hscrollbar(f, area, max_content_w, hscroll, config);
 }

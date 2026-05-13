@@ -17,8 +17,33 @@ pub fn mime_icon(mime: &str) -> &'static str {
     }
 }
 
-/// Icon for an installed application. Currently a generic glyph; specialized
-/// per-app icons would require pulling Icon= out of the .desktop file.
-pub fn app_icon(_id: &str) -> &'static str {
-    md::MD_APPLICATION
+/// Icon for an app's deduced `Categories=` bucket. Ported from bstl so the
+/// glyph set matches users' muscle memory if they've ever used the launcher.
+pub fn category_icon(category: &str) -> &'static str {
+    match category {
+        "Utilities" => fa::FA_GEAR,
+        "Development" => fa::FA_HAMMER,
+        "Network" => md::MD_EARTH,
+        "Audio/Video" => fa::FA_MUSIC,
+        "Graphics" => fa::FA_PAINTBRUSH,
+        "System" => fa::FA_DESKTOP,
+        "Office" => fa::FA_BOOK,
+        "Games" => fa::FA_GAMEPAD,
+        "Education" => fa::FA_GRADUATION_CAP,
+        "Settings" => fa::FA_SLIDERS,
+        "TUI" => fa::FA_TERMINAL,
+        other => {
+            let lower = other.to_ascii_lowercase();
+            if lower.contains("script") {
+                md::MD_SCRIPT_TEXT
+            } else if lower.contains("terminal")
+                || lower.contains("tui")
+                || lower.contains("console")
+            {
+                fa::FA_TERMINAL
+            } else {
+                oct::OCT_DASH
+            }
+        }
+    }
 }

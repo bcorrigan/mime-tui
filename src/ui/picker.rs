@@ -11,44 +11,34 @@ use ratatui::{
 use tui_input::Input;
 
 pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
+    let secondary = Style::default().fg(Theme::parse_color(&config.colors.secondary));
+
     let (title, items) = match app.mode.clone() {
         Mode::PickApp { for_mime } => {
             let visible: Vec<crate::model::DesktopApp> =
                 app.picker_visible_apps().into_iter().cloned().collect();
-            let items: Vec<String> = visible
+            let items: Vec<Line<'static>> = visible
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
                     let rel = app.relation_of(&for_mime, &a.id);
-                    let body = format!("{}    {}", a.name, a.id);
-                    decorate_row(rel, in_marked_range(app, i), &body)
+                    build_row(rel, in_marked_range(app, i), &a.name, &a.id, secondary)
                 })
                 .collect();
-            (
-                format!(" Toggle apps for {} ", for_mime),
-                items,
-            )
+            (format!(" Toggle apps for {} ", for_mime), items)
         }
         Mode::PickMime { for_app } => {
             let visible: Vec<crate::model::MimeType> =
                 app.picker_visible_mimes().into_iter().cloned().collect();
-            let items: Vec<String> = visible
+            let items: Vec<Line<'static>> = visible
                 .iter()
                 .enumerate()
                 .map(|(i, m)| {
                     let rel = app.relation_of(&m.id, &for_app);
-                    let body = if m.description.is_empty() {
-                        m.id.clone()
-                    } else {
-                        format!("{}    {}", m.id, m.description)
-                    };
-                    decorate_row(rel, in_marked_range(app, i), &body)
+                    build_row(rel, in_marked_range(app, i), &m.id, &m.description, secondary)
                 })
                 .collect();
-            (
-                format!(" Toggle mime types for {} ", for_app),
-                items,
-            )
+            (format!(" Toggle mime types for {} ", for_app), items)
         }
         _ => return,
     };
@@ -79,16 +69,37 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
 
     render_picker_search(f, chunks[0], &app.pick_input, config);
 
-    let clamped = app.pick_selected.min(items.len().saturating_sub(1));
-    layout::render_list(
+    // Compute max hscroll based on the longest row's overflow vs the list's
+    // inner content width. layout::render_list_lines adds 2 borders + 2 cells
+    // of left/right padding, so subtract 4.
+    let inner_width = chunks[1].width.saturating_sub(4);
+    let max_line_w = items.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    let max_hscroll = max_line_w.saturating_sub(inner_width);
+    let hscroll = app.pick_hscroll.min(max_hscroll);
+    app.pick_hscroll = hscroll;
+
+    let visible_items: Vec<Line<'static>> = items
+        .iter()
+        .map(|l| scroll_line(l, hscroll as usize))
+        .collect();
+
+    let clamped = app.pick_selected.min(visible_items.len().saturating_sub(1));
+    layout::render_list_lines(
         f,
         chunks[1],
         " Candidates ",
-        &items,
+        &visible_items,
         Some(clamped),
         true,
         config,
         &mut app.pick_list_state,
+    );
+    layout::render_list_hscrollbar(
+        f,
+        chunks[1],
+        max_line_w as usize,
+        hscroll as usize,
+        config,
     );
 
     let mark_active = app.pick_mark.is_some();
@@ -114,9 +125,16 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
     f.render_widget(Paragraph::new(hint), chunks[2]);
 }
 
-/// Two single-char prefix slots: relation indicator + mark indicator. Padded
-/// out so column alignment stays consistent regardless of which markers fire.
-fn decorate_row(rel: Option<Relation>, marked: bool, body: &str) -> String {
+/// Build a single picker row as a Line with three logical parts:
+/// `[rel][mark] primary    secondary` — where the secondary span carries a
+/// themed style so it visually de-emphasises against the primary text.
+fn build_row(
+    rel: Option<Relation>,
+    marked: bool,
+    primary: &str,
+    secondary: &str,
+    secondary_style: Style,
+) -> Line<'static> {
     let rel_char = match rel {
         Some(Relation::Default) => '★',
         Some(Relation::Associated) => '✓',
@@ -124,7 +142,53 @@ fn decorate_row(rel: Option<Relation>, marked: bool, body: &str) -> String {
         None => ' ',
     };
     let mark_char = if marked { '▌' } else { ' ' };
-    format!("{}{} {}", rel_char, mark_char, body)
+    let prefix = format!("{}{} ", rel_char, mark_char);
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw(prefix),
+        Span::raw(primary.to_string()),
+    ];
+    if !secondary.is_empty() {
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(secondary.to_string(), secondary_style));
+    }
+    Line::from(spans)
+}
+
+/// Drop the first `hscroll` columns from the line, but keep span[0] (the
+/// relation+mark prefix) pinned at column 0 so the user retains visual
+/// context while scrolling. Char-width is approximated as 1 per char —
+/// acceptable for mime ids and app names, which are ~always ASCII.
+fn scroll_line(line: &Line<'static>, hscroll: usize) -> Line<'static> {
+    if hscroll == 0 || line.spans.is_empty() {
+        return line.clone();
+    }
+    let prefix = line.spans[0].clone();
+    let rest = &line.spans[1..];
+
+    let mut consumed: usize = 0;
+    let mut new_spans: Vec<Span<'static>> = vec![prefix];
+
+    for span in rest {
+        let span_w = span.width();
+        if consumed + span_w <= hscroll {
+            // Whole span is to the left of the visible area — skip.
+            consumed += span_w;
+            continue;
+        }
+        if consumed >= hscroll {
+            // Entire span is visible — pass through.
+            new_spans.push(span.clone());
+        } else {
+            // Span straddles the scroll boundary; keep its tail.
+            let skip_chars = hscroll - consumed;
+            let tail: String = span.content.as_ref().chars().skip(skip_chars).collect();
+            new_spans.push(Span::styled(tail, span.style));
+            consumed += span_w;
+        }
+    }
+
+    Line::from(new_spans)
 }
 
 fn in_marked_range(app: &App, i: usize) -> bool {
@@ -140,6 +204,89 @@ fn in_marked_range(app: &App, i: usize) -> bool {
 
 fn render_picker_search(f: &mut Frame, area: Rect, input: &Input, config: &MimeTuiConfig) {
     layout::render_search_bar(f, area, input, Focus::Search, config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn sample_row() -> Line<'static> {
+        // Mimic a real picker row: [marker][space] primary    secondary
+        Line::from(vec![
+            Span::raw("★ "),                    // span 0: prefix (3 cols if we count the ★)
+            Span::raw("text/html"),             // span 1: primary
+            Span::raw("    "),                  // span 2: separator
+            Span::raw("HTML document"),         // span 3: secondary
+        ])
+    }
+
+    #[test]
+    fn zero_hscroll_returns_unchanged_line() {
+        let line = sample_row();
+        let out = scroll_line(&line, 0);
+        assert_eq!(line_text(&out), line_text(&line));
+    }
+
+    #[test]
+    fn prefix_stays_pinned_when_scrolling() {
+        // Scroll past the primary text entirely.
+        let line = sample_row();
+        let out = scroll_line(&line, 100);
+        // First span must still be the prefix.
+        let first = &out.spans[0];
+        assert_eq!(first.content.as_ref(), "★ ");
+    }
+
+    #[test]
+    fn hscroll_drops_leading_chars_after_prefix() {
+        let line = sample_row();
+        // hscroll = 5 → skip 5 chars from "text/html" + onward.
+        // "text/html" is 9 chars; first 5 chars dropped → "html".
+        let out = scroll_line(&line, 5);
+        let text = line_text(&out);
+        // Prefix is intact, then "html" (rest of primary), then separator,
+        // then secondary.
+        assert!(text.starts_with("★ "));
+        assert!(text.contains("html"));
+        assert!(!text.contains("text/")); // the dropped portion is gone
+        assert!(text.contains("HTML document"));
+    }
+
+    #[test]
+    fn hscroll_can_remove_entire_spans() {
+        let line = sample_row();
+        // "text/html" (9) + "    " (4) = 13 — skip all of those, land at "HTML…".
+        let out = scroll_line(&line, 13);
+        let text = line_text(&out);
+        assert!(text.starts_with("★ "));
+        assert!(text.contains("HTML document"));
+        assert!(!text.contains("text/html"));
+    }
+
+    #[test]
+    fn hscroll_past_everything_leaves_only_prefix() {
+        let line = sample_row();
+        let out = scroll_line(&line, 9999);
+        assert_eq!(line_text(&out), "★ ");
+    }
+
+    #[test]
+    fn span_style_is_preserved_after_partial_skip() {
+        let style = Style::default().add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![
+            Span::raw("p "),                          // prefix
+            Span::styled("abcdef", style),            // primary, bolded
+        ]);
+        let out = scroll_line(&line, 3);
+        // We skipped 3 chars of "abcdef" → "def"; style must follow.
+        let trimmed_span = &out.spans[1];
+        assert_eq!(trimmed_span.content.as_ref(), "def");
+        assert_eq!(trimmed_span.style, style);
+    }
 }
 
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {

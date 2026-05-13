@@ -11,7 +11,7 @@ pub mod desktop;
 pub mod mime_info;
 pub mod mimeapps;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub struct Storage {
     pub conn: Connection,
@@ -76,6 +76,35 @@ impl Storage {
                     file_mtime      INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE scan_meta (
+                    directory       TEXT PRIMARY KEY,
+                    dir_mtime       INTEGER NOT NULL,
+                    scanned_at      INTEGER NOT NULL
+                );
+                "#,
+            )?;
+        }
+        if current < 2 {
+            // v2 adds a `raw_categories` column on `apps`, used to derive the
+            // per-app category icon. Easiest migration is to rebuild the
+            // cache — the data is all derivable from .desktop files which
+            // are re-walked on next startup by `refresh_app_cache`.
+            tx.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS apps;
+                DROP TABLE IF EXISTS scan_meta;
+                CREATE TABLE apps (
+                    id              TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL,
+                    exec            TEXT NOT NULL,
+                    terminal        INTEGER NOT NULL,
+                    comment         TEXT NOT NULL DEFAULT '',
+                    raw_mime_types  TEXT NOT NULL DEFAULT '',
+                    raw_categories  TEXT NOT NULL DEFAULT '',
+                    source_path     TEXT NOT NULL,
+                    file_mtime      INTEGER NOT NULL
+                );
+                CREATE INDEX apps_source ON apps(source_path);
                 CREATE TABLE scan_meta (
                     directory       TEXT PRIMARY KEY,
                     dir_mtime       INTEGER NOT NULL,

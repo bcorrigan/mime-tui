@@ -23,6 +23,7 @@ pub struct ParsedDesktop {
     pub exec: String,
     pub terminal: bool,
     pub raw_mime_types: String,
+    pub raw_categories: String,
 }
 
 /// Refresh the cached `apps` table by walking the given directories. Uses
@@ -92,8 +93,8 @@ pub fn refresh_app_cache(conn: &mut Connection, dirs: &[String]) -> Result<()> {
             tx.execute("DELETE FROM apps WHERE source_path = ?", params![path_str])?;
             if let Some(app) = parsed {
                 tx.execute(
-                    "INSERT OR REPLACE INTO apps(id, name, exec, terminal, comment, raw_mime_types, source_path, file_mtime)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO apps(id, name, exec, terminal, comment, raw_mime_types, raw_categories, source_path, file_mtime)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         app.id,
                         app.name,
@@ -101,6 +102,7 @@ pub fn refresh_app_cache(conn: &mut Connection, dirs: &[String]) -> Result<()> {
                         app.terminal as i32,
                         app.comment,
                         app.raw_mime_types,
+                        app.raw_categories,
                         path_str,
                         file_mtime,
                     ],
@@ -143,10 +145,11 @@ pub fn refresh_app_cache(conn: &mut Connection, dirs: &[String]) -> Result<()> {
 }
 
 /// Load all cached apps as `DesktopApp`s, with `mime_types` parsed into a
-/// trimmed list.
+/// trimmed list and `category` derived from `raw_categories` via
+/// [`group_category`].
 pub fn load_apps(conn: &Connection) -> Result<Vec<DesktopApp>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, exec, terminal, comment, raw_mime_types
+        "SELECT id, name, exec, terminal, comment, raw_mime_types, raw_categories
          FROM apps ORDER BY name COLLATE NOCASE",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -157,11 +160,13 @@ pub fn load_apps(conn: &Connection) -> Result<Vec<DesktopApp>> {
             r.get::<_, i32>(3)? != 0,
             r.get::<_, String>(4)?,
             r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
         ))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (id, name, exec, terminal, comment, raw_mime_types) = r?;
+        let (id, name, exec, terminal, comment, raw_mime_types, raw_categories) = r?;
+        let category = group_category(&raw_categories, &name);
         out.push(DesktopApp {
             id,
             name,
@@ -169,9 +174,44 @@ pub fn load_apps(conn: &Connection) -> Result<Vec<DesktopApp>> {
             exec,
             terminal,
             mime_types: split_semicolons(&raw_mime_types),
+            category,
         });
     }
     Ok(out)
+}
+
+/// Map a `Categories=` raw string + app name into a single display bucket.
+/// First matching keyword wins; falls back to "Utilities" when nothing
+/// matches. Ported from bstl, where the same buckets drive the launcher's
+/// category-list ordering.
+pub fn group_category(raw: &str, _app_name: &str) -> String {
+    let raw = raw.to_lowercase();
+    if raw.contains("game") {
+        "Games".into()
+    } else if raw.contains("utility") {
+        "Utilities".into()
+    } else if raw.contains("development") {
+        "Development".into()
+    } else if raw.contains("network") {
+        "Network".into()
+    } else if raw.contains("audio") || raw.contains("video") {
+        "Audio/Video".into()
+    } else if raw.contains("graphics")
+        || raw.contains("2dgraphics")
+        || raw.contains("3dgraphics")
+    {
+        "Graphics".into()
+    } else if raw.contains("system") {
+        "System".into()
+    } else if raw.contains("office") {
+        "Office".into()
+    } else if raw.contains("education") {
+        "Education".into()
+    } else if raw.contains("settings") {
+        "Settings".into()
+    } else {
+        "Utilities".into()
+    }
 }
 
 fn mtime_secs(p: &Path) -> Option<i64> {
@@ -191,6 +231,7 @@ pub fn parse_desktop_file(path: &Path) -> Option<ParsedDesktop> {
     let mut exec: Option<String> = None;
     let mut comment: Option<String> = None;
     let mut mime_types: Option<String> = None;
+    let mut categories: Option<String> = None;
     let mut no_display = false;
     let mut terminal = false;
     let mut in_desktop_entry = false;
@@ -219,6 +260,7 @@ pub fn parse_desktop_file(path: &Path) -> Option<ParsedDesktop> {
             "Exec" => exec = Some(value.to_string()),
             "Comment" => comment = Some(value.to_string()),
             "MimeType" => mime_types = Some(value.to_string()),
+            "Categories" => categories = Some(value.to_string()),
             "NoDisplay" => no_display = value == "true",
             "Hidden" => no_display = no_display || value == "true",
             "Terminal" => terminal = value == "true",
@@ -245,6 +287,7 @@ pub fn parse_desktop_file(path: &Path) -> Option<ParsedDesktop> {
         exec: clean_exec(&exec_raw),
         terminal,
         raw_mime_types: mime_types.unwrap_or_default(),
+        raw_categories: categories.unwrap_or_default(),
     })
 }
 

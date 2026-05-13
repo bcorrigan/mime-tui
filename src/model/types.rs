@@ -10,6 +10,12 @@ pub struct DesktopApp {
     pub exec: String,
     pub terminal: bool,
     pub mime_types: Vec<String>,
+    /// Single-bucket category derived from the `.desktop` `Categories=`
+    /// field — drives the per-app icon. One of: Utilities, Development,
+    /// Network, Audio/Video, Graphics, System, Office, Games, Education,
+    /// Settings, or a passthrough if the raw value doesn't match a known
+    /// keyword.
+    pub category: String,
 }
 
 impl DesktopApp {

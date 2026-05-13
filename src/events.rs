@@ -110,6 +110,31 @@ fn handle_key_browse(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
     }
 
+    // Shift+←/→ horizontally scrolls the focused list. Intercepted before
+    // plain ←/→ which is reserved for pane navigation. Dispatches to
+    // left_hscroll or right_hscroll based on which pane is focused.
+    if key.modifiers == KeyModifiers::SHIFT {
+        match (key.code, app.focus) {
+            (KeyCode::Left, Focus::Right) => {
+                app.right_hscroll = app.right_hscroll.saturating_sub(LEFT_HSCROLL_STEP);
+                return Ok(false);
+            }
+            (KeyCode::Right, Focus::Right) => {
+                app.right_hscroll = app.right_hscroll.saturating_add(LEFT_HSCROLL_STEP);
+                return Ok(false);
+            }
+            (KeyCode::Left, _) => {
+                app.left_hscroll = app.left_hscroll.saturating_sub(LEFT_HSCROLL_STEP);
+                return Ok(false);
+            }
+            (KeyCode::Right, _) => {
+                app.left_hscroll = app.left_hscroll.saturating_add(LEFT_HSCROLL_STEP);
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     // Emacs-style page nav: C-v down, M-v up. Intentionally undocumented in
     // the status bar — power-user affordance, not first-class UX.
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('v') {
@@ -278,17 +303,20 @@ fn right_pane_count(app: &App) -> usize {
     }
 }
 
+/// Columns to scroll on each Shift+←/→ press in by-mime / by-app left list.
+const LEFT_HSCROLL_STEP: u16 = 8;
+
 fn reset_left_selection(app: &mut App) {
     app.selected_left = 0;
     app.selected_right = 0;
+    app.left_hscroll = 0;
+    app.right_hscroll = 0;
 }
 
-/// Extract the (mime, app_id, display_label) currently targeted by the right
-/// pane selection — view-aware:
-///   * by-mime: mime is the left selection, app_id is right pane's selected
-///     entry from `effective_associations_for(mime)`.
-///   * by-app: app_id is the left selection, mime is right pane's selected
-///     entry from `mime_list_for_app(app)`.
+/// Extract the (mime, app_id, app_name) currently targeted by the right pane
+/// selection. View-aware on the *where it comes from* axis, view-agnostic on
+/// the *what it returns* axis — the third element is always the app's display
+/// name, so flash-message templates can be written once.
 fn target_pair(app: &App) -> Option<(String, String, String)> {
     match app.view {
         View::ByMime => {
@@ -301,30 +329,34 @@ fn target_pair(app: &App) -> Option<(String, String, String)> {
         View::ByApp => {
             let a = app.currently_selected_app()?;
             let app_id = a.id.clone();
+            let app_name = a.name.clone();
             let list = app.mime_list_for_app(&app_id);
             let (mime, _rel) = list.get(app.selected_right)?;
-            Some((mime.id.clone(), app_id, mime.id.clone()))
+            Some((mime.id.clone(), app_id, app_name))
         }
     }
 }
 
 fn action_set_default(app: &mut App) {
-    let Some((mime_id, app_id, label)) = target_pair(app) else {
+    let Some((mime_id, app_id, app_name)) = target_pair(app) else {
         return;
     };
     app.action_set_default(&mime_id, &app_id);
-    app.set_flash(match app.view {
-        View::ByMime => format!("Default for {} → {}", mime_id, label),
-        View::ByApp => format!("{} now default for {}", label, mime_id),
-    });
+    app.set_flash(format!(
+        "{} is now the default app for {}",
+        app_name, mime_id
+    ));
 }
 
 fn action_remove(app: &mut App) {
-    let Some((mime_id, app_id, label)) = target_pair(app) else {
+    let Some((mime_id, app_id, app_name)) = target_pair(app) else {
         return;
     };
     app.action_remove_assoc(&mime_id, &app_id);
-    app.set_flash(format!("Removed: {} ↔ {}", mime_id, label));
+    app.set_flash(format!(
+        "{} is no longer associated with {}",
+        app_name, mime_id
+    ));
 
     // Keep right-pane selection in bounds.
     let new_count = right_pane_count(app);
@@ -341,7 +373,7 @@ fn action_clear_default(app: &mut App) {
         return;
     };
     app.action_clear_default(&mime_id);
-    app.set_flash(format!("Cleared default for {}", mime_id));
+    app.set_flash(format!("{} now has no default app", mime_id));
 }
 
 fn do_save(app: &mut App) {
@@ -371,6 +403,9 @@ fn do_save(app: &mut App) {
 /// (we'd need a `pick_list_rect: Option<Rect>` plumbed through draw), and a
 /// generic chunk works fine in practice since users can page repeatedly.
 const PICKER_PAGE: usize = 10;
+
+/// Columns to scroll on each ←/→/Ctrl-B/Ctrl-F press in the picker.
+const PICKER_HSCROLL_STEP: u16 = 8;
 
 
 fn handle_key_picker(app: &mut App, key: KeyEvent) -> Result<bool> {
@@ -426,6 +461,20 @@ fn handle_key_picker(app: &mut App, key: KeyEvent) -> Result<bool> {
             }
             return Ok(false);
         }
+
+        // Horizontal scroll for long mime ids / descriptions that overflow
+        // the picker width. Intercepted before forward_to_input so Ctrl-F /
+        // Ctrl-B don't fall through to char-by-char input nav (Ctrl-A /
+        // Ctrl-E still cover start/end of the search input).
+        (KeyCode::Left, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+            app.pick_hscroll = app.pick_hscroll.saturating_sub(PICKER_HSCROLL_STEP);
+            return Ok(false);
+        }
+        (KeyCode::Right, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+            app.pick_hscroll = app.pick_hscroll.saturating_add(PICKER_HSCROLL_STEP);
+            return Ok(false);
+        }
+
         _ => {}
     }
     forward_to_input(&mut app.pick_input, key);
@@ -433,6 +482,7 @@ fn handle_key_picker(app: &mut App, key: KeyEvent) -> Result<bool> {
     // Easier to clear than to track which mime/app it had pointed at.
     app.pick_selected = 0;
     app.pick_mark = None;
+    app.pick_hscroll = 0;
     app.reset_cursor_blink();
     Ok(false)
 }
@@ -451,9 +501,59 @@ fn picker_visible_count(app: &App) -> usize {
 
 // ───────────── Help ──────────────────────────────────────────────────────────
 
-fn handle_key_help(app: &mut App, _key: KeyEvent) -> bool {
-    // Any key dismisses the help overlay.
-    app.mode = Mode::Browse;
+const HELP_PAGE: u16 = 10;
+
+fn handle_key_help(app: &mut App, key: KeyEvent) -> bool {
+    match (key.code, key.modifiers) {
+        // Explicit close. Reset scroll so next open starts at the top.
+        (KeyCode::Esc, _)
+        | (KeyCode::Enter, _)
+        | (KeyCode::Char('q'), _)
+        | (KeyCode::Char('Q'), _) => {
+            app.mode = Mode::Browse;
+            app.help_scroll = 0;
+        }
+
+        // Page down: Space, PgDn, Ctrl-V.
+        (KeyCode::Char(' '), _)
+        | (KeyCode::PageDown, _)
+        | (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
+            app.help_scroll = app.help_scroll.saturating_add(HELP_PAGE);
+        }
+        // Page up: b, PgUp, Alt-V.
+        (KeyCode::Char('b'), _)
+        | (KeyCode::PageUp, _)
+        | (KeyCode::Char('v'), KeyModifiers::ALT)
+        | (KeyCode::Char('V'), KeyModifiers::ALT) => {
+            app.help_scroll = app.help_scroll.saturating_sub(HELP_PAGE);
+        }
+
+        // Single-line nav (arrows + vim/emacs aliases).
+        (KeyCode::Down, _)
+        | (KeyCode::Char('j'), _)
+        | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
+        }
+        (KeyCode::Up, _)
+        | (KeyCode::Char('k'), _)
+        | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
+        }
+
+        // Top / bottom.
+        (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
+            app.help_scroll = 0;
+        }
+        (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
+            // u16::MAX → clamped to max_scroll by the renderer.
+            app.help_scroll = u16::MAX;
+        }
+
+        _ => {
+            // Unknown keys are no-ops so the user can scroll without
+            // accidentally dismissing the help.
+        }
+    }
     false
 }
 

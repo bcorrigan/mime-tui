@@ -27,6 +27,17 @@ pub struct Theme {
     pub focus: String,
     pub unfocused: String,
     pub highlight: String,
+    /// Foreground for de-emphasized secondary text — e.g. the `.desktop` id
+    /// trailing an app name in the picker, or a mime's human description.
+    /// Light gray by default; theme it separately from `unfocused` (which is
+    /// the selection-bar background of an unfocused list).
+    pub secondary: String,
+    /// Colour of the scrollbar thumb (the moving indicator). Empty means
+    /// "follow `focus`"; resolved at load time.
+    pub scrollbar_thumb: String,
+    /// Colour of the scrollbar track (the rail the thumb slides along).
+    /// Empty means "follow `unfocused`"; resolved at load time.
+    pub scrollbar_track: String,
     pub border_style: String,
     pub highlight_type: String,
     /// Empty means "follow `focus`"; resolved at load time.
@@ -46,6 +57,9 @@ impl Default for Theme {
             // (`#0000ff`) made selected rows nearly unreadable on dark
             // terminal themes.
             highlight: "#ffd700".into(),
+            secondary: "#808080".into(),
+            scrollbar_thumb: String::new(),
+            scrollbar_track: String::new(),
             border_style: "rounded".into(),
             highlight_type: "background".into(),
             cursor_color: String::new(),
@@ -129,10 +143,22 @@ impl Theme {
 
 fn parse_toml_config(content: &str) -> Result<MimeTuiConfig, toml::de::Error> {
     let mut cfg: MimeTuiConfig = toml::from_str(content)?;
+    resolve_fallback_colors(&mut cfg);
+    Ok(cfg)
+}
+
+/// Several theme fields default to "empty means follow another field". This
+/// resolves those at load time so the renderer sees concrete hex strings.
+fn resolve_fallback_colors(cfg: &mut MimeTuiConfig) {
     if cfg.colors.cursor_color.trim().is_empty() {
         cfg.colors.cursor_color = cfg.colors.focus.clone();
     }
-    Ok(cfg)
+    if cfg.colors.scrollbar_thumb.trim().is_empty() {
+        cfg.colors.scrollbar_thumb = cfg.colors.focus.clone();
+    }
+    if cfg.colors.scrollbar_track.trim().is_empty() {
+        cfg.colors.scrollbar_track = cfg.colors.unfocused.clone();
+    }
 }
 
 /// Top-level config loader. Falls back to defaults if no config file exists,
@@ -152,7 +178,9 @@ pub fn load_config() -> MimeTuiConfig {
     };
 
     let Some(path) = path else {
-        return MimeTuiConfig::default();
+        let mut cfg = MimeTuiConfig::default();
+        resolve_fallback_colors(&mut cfg);
+        return cfg;
     };
 
     let content = match fs::read_to_string(&path) {

@@ -68,6 +68,16 @@ pub struct App {
     pub pending: PendingEdits,
     pub selected_left: usize,
     pub selected_right: usize,
+    /// Horizontal scroll offset for the focused left list in by-mime /
+    /// by-app views, in display columns. Long mime ids extend past the
+    /// pane's width; Shift+←/→ drives this. Reset on view switch and on
+    /// search-input changes.
+    pub left_hscroll: u16,
+    /// Same as `left_hscroll` but for the right pane's list. Some apps
+    /// declare very long mime ids (`application/vnd.openxmlformats-...`)
+    /// that overflow the right pane in by-app view; Shift+←/→ while
+    /// Focus::Right drives this.
+    pub right_hscroll: u16,
     pub left_list_state: ListState,
     pub right_list_state: ListState,
     pub left_rect: Option<Rect>,
@@ -80,7 +90,16 @@ pub struct App {
     /// `[min(mark,sel)..=max(mark,sel)]` as a multi-selection. Space/Enter
     /// then operates on the entire range. Cleared when search input changes.
     pub pick_mark: Option<usize>,
+    /// Horizontal scroll offset for the picker list, in display columns.
+    /// Long mime ids overflow the picker width; this lets the user pan
+    /// across with ←/→ or Ctrl-B/Ctrl-F. The relation marker (first span)
+    /// stays pinned at column 0 so context isn't lost.
+    pub pick_hscroll: u16,
     pub pick_list_state: ListState,
+    /// Row offset for the scrollable help overlay. Persists between F1
+    /// openings so the user comes back where they left off; reset on
+    /// dismiss.
+    pub help_scroll: u16,
     /// Transient one-line notice (e.g. "Saved 3 edits"). Cleared after a few
     /// seconds so it doesn't accumulate.
     pub flash: Option<(String, Instant)>,
@@ -104,6 +123,8 @@ impl App {
             pending: PendingEdits::default(),
             selected_left: 0,
             selected_right: 0,
+            left_hscroll: 0,
+            right_hscroll: 0,
             left_list_state: ListState::default(),
             right_list_state: ListState::default(),
             left_rect: None,
@@ -112,7 +133,9 @@ impl App {
             pick_input: Input::default(),
             pick_selected: 0,
             pick_mark: None,
+            pick_hscroll: 0,
             pick_list_state: ListState::default(),
+            help_scroll: 0,
             flash: None,
             config,
             fuzzy_matcher: SkimMatcherV2::default(),
@@ -138,6 +161,8 @@ impl App {
         self.input = Input::default();
         self.selected_left = 0;
         self.selected_right = 0;
+        self.left_hscroll = 0;
+        self.right_hscroll = 0;
         self.left_list_state.select(Some(0));
     }
 
@@ -471,6 +496,7 @@ impl App {
         self.pick_input = Input::default();
         self.pick_selected = 0;
         self.pick_mark = None;
+        self.pick_hscroll = 0;
         self.pick_list_state.select(Some(0));
     }
 
@@ -479,12 +505,14 @@ impl App {
         self.pick_input = Input::default();
         self.pick_selected = 0;
         self.pick_mark = None;
+        self.pick_hscroll = 0;
         self.pick_list_state.select(Some(0));
     }
 
     pub fn close_picker(&mut self) {
         self.mode = Mode::Browse;
         self.pick_mark = None;
+        self.pick_hscroll = 0;
     }
 
     /// Set the mark at the current cursor if there isn't one; clear it
@@ -652,6 +680,8 @@ impl App {
             pending: PendingEdits::default(),
             selected_left: 0,
             selected_right: 0,
+            left_hscroll: 0,
+            right_hscroll: 0,
             left_list_state: ListState::default(),
             right_list_state: ListState::default(),
             left_rect: None,
@@ -660,7 +690,9 @@ impl App {
             pick_input: Input::default(),
             pick_selected: 0,
             pick_mark: None,
+            pick_hscroll: 0,
             pick_list_state: ListState::default(),
+            help_scroll: 0,
             flash: None,
             config: MimeTuiConfig::default(),
             fuzzy_matcher: SkimMatcherV2::default(),
@@ -718,6 +750,7 @@ mod tests {
                 exec: "firefox".into(),
                 terminal: false,
                 mime_types: vec!["text/html".into()],
+                category: "Network".into(),
             },
             DesktopApp {
                 id: "chromium.desktop".into(),
@@ -726,6 +759,7 @@ mod tests {
                 exec: "chromium".into(),
                 terminal: false,
                 mime_types: vec!["text/html".into()],
+                category: "Network".into(),
             },
         ];
         let mimes = vec![MimeType {
@@ -793,6 +827,7 @@ mod tests {
             exec: "outlier".into(),
             terminal: false,
             mime_types: vec![], // doesn't declare text/html
+            category: "Utilities".into(),
         }];
         apps.extend(sample_world().0);
         let (_, mimes, assoc) = sample_world();
