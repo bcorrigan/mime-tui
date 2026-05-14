@@ -217,23 +217,12 @@ enum SectionEntry {
     Unknown { header: String, lines: Vec<String> },
 }
 
-/// Apply `pending` to the user's `mimeapps.list`. Atomic: writes a tempfile
-/// then renames into place. Keeps one rolling `.bak` alongside. Best-effort
-/// triggers `update-desktop-database` on `$XDG_DATA_HOME/applications`
-/// afterwards so other apps pick up the change without re-login.
-pub fn save_user_file(pending: &PendingEdits) -> Result<()> {
-    let path = user_mimeapps_path()
-        .ok_or_else(|| eyre::eyre!("could not resolve XDG_CONFIG_HOME"))?;
-    save_user_file_at(&path, pending)?;
-    let _ = run_update_desktop_database();
-    Ok(())
-}
-
-/// Best-effort: refresh `$XDG_DATA_HOME/applications/mimeinfo.cache` so DEs see
-/// the change immediately. Failures are intentionally ignored — the binary
-/// isn't always installed, and the user might not have write access to the
-/// target.
-fn run_update_desktop_database() -> Option<()> {
+/// Best-effort: refresh `$XDG_DATA_HOME/applications/mimeinfo.cache` so DEs
+/// see the change immediately. Called from `App::save` and `App::save_force`
+/// after a successful write. Failures are intentionally ignored — the
+/// binary isn't always installed, and the user might not have write access
+/// to the target.
+pub fn run_update_desktop_database() -> Option<()> {
     let apps = dirs::data_dir()?.join("applications");
     if !apps.exists() {
         return None;
@@ -488,6 +477,252 @@ fn serialize_kv(map: &BTreeMap<String, Vec<String>>) -> String {
     out
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+//                           Conflict-aware save
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Snapshot of the user's `mimeapps.list` taken at startup. Used by
+/// `save_user_file_safely_at` to detect mid-session external modifications.
+#[derive(Debug, Clone, Default)]
+pub struct UserFileBaseline {
+    /// Parsed state of the file when we read it. Conflict detection compares
+    /// per-`(section, mime)` keys against the current on-disk state.
+    pub assoc: OnDiskAssoc,
+    /// Exact bytes we read. Used as a cheap unchanged-file fast path
+    /// (`current_raw == baseline.raw` → no external change, skip the
+    /// semantic compare entirely).
+    pub raw: String,
+}
+
+/// A single per-`(mime, ...)` clash between our pending edits and external
+/// changes that landed after we took the baseline. See
+/// `detect_conflicts` for what counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MimeConflict {
+    pub mime: String,
+    pub kind: ConflictKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// We staged a change to this mime's default; external also changed it to
+    /// something different (or we cleared and they set, etc).
+    DefaultChanged {
+        ours: Option<String>,
+        theirs: Option<String>,
+    },
+    /// We staged add(X); external recorded a removal of X (or vice versa).
+    /// Opposite intents.
+    AddRemoveOpposed {
+        app_id: String,
+        /// `true` if our pending was an add, `false` if it was a remove.
+        we_added: bool,
+    },
+}
+
+#[derive(Debug)]
+pub enum SaveError {
+    /// The user-file changed externally and at least one pending edit
+    /// overlaps with that change. Pending state is untouched.
+    Conflicts(Vec<MimeConflict>),
+    /// An I/O or parse error from the underlying [`save_user_file_at`].
+    Io(eyre::Report),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SaveOutcome {
+    /// Number of pending edits that were committed.
+    pub written: usize,
+    /// `true` if the on-disk file changed since we read the baseline (we
+    /// merged non-conflicting external edits in). UI flashes a hint about
+    /// this so the user knows their save preserved a foreign change.
+    pub merged_external_changes: bool,
+}
+
+/// Read the user's `mimeapps.list` once and capture both its parsed state
+/// and its raw bytes. Used by `App` at startup to snapshot a baseline that
+/// `save_user_file_safely_at` later compares against.
+pub fn read_user_file_baseline() -> UserFileBaseline {
+    user_mimeapps_path()
+        .map(|p| read_user_file_baseline_at(&p))
+        .unwrap_or_default()
+}
+
+pub fn read_user_file_baseline_at(path: &Path) -> UserFileBaseline {
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let mut assoc = OnDiskAssoc::default();
+    merge_one(&raw, path, &mut assoc);
+    UserFileBaseline { assoc, raw }
+}
+
+/// Conflict-aware save. Re-reads the file at `path`, compares with
+/// `baseline` (hash compare first, then semantic per-mime if the bytes
+/// differ), and either:
+///  - writes our pending edits on top of the current disk state (so foreign
+///    edits to unrelated mimes are preserved), or
+///  - returns the list of conflicting mimes without writing anything.
+pub fn save_user_file_safely_at(
+    path: &Path,
+    pending: &PendingEdits,
+    baseline: &UserFileBaseline,
+) -> Result<SaveOutcome, SaveError> {
+    let current_raw = fs::read_to_string(path).unwrap_or_default();
+    let written = pending.count();
+
+    // Fast path: file untouched since baseline → no race possible.
+    if current_raw == baseline.raw {
+        save_user_file_at(path, pending).map_err(SaveError::Io)?;
+        return Ok(SaveOutcome {
+            written,
+            merged_external_changes: false,
+        });
+    }
+
+    // File differs — could be external edit, or could be a comment / blank
+    // line added (no semantic conflict). Re-parse and check per-mime.
+    let mut current = OnDiskAssoc::default();
+    merge_one(&current_raw, path, &mut current);
+
+    let conflicts = detect_conflicts(&baseline.assoc, &current, pending);
+    if !conflicts.is_empty() {
+        return Err(SaveError::Conflicts(conflicts));
+    }
+
+    save_user_file_at(path, pending).map_err(SaveError::Io)?;
+    Ok(SaveOutcome {
+        written,
+        merged_external_changes: true,
+    })
+}
+
+/// Public for the `App::action_force_save` path — bypasses conflict checks
+/// and writes pending edits over whatever's on disk. Foreign changes that
+/// overlap with the user's pending edits get clobbered.
+pub fn save_user_file_force_at(
+    path: &Path,
+    pending: &PendingEdits,
+) -> eyre::Result<()> {
+    save_user_file_at(path, pending)
+}
+
+/// Compute the conflict set. For each pending edit, ask "did external touch
+/// the same `(section, mime)` differently from how we want it?".
+///
+/// Idempotent overlaps (external set X, we want X) and complementary
+/// overlaps (we want to add Y, external also added Y) are *not* conflicts —
+/// just unions that compose cleanly at write time.
+pub fn detect_conflicts(
+    baseline: &OnDiskAssoc,
+    current: &OnDiskAssoc,
+    pending: &PendingEdits,
+) -> Vec<MimeConflict> {
+    let mut conflicts: Vec<MimeConflict> = Vec::new();
+
+    // ── default-app conflicts ───────────────────────────────────────────
+    for (mime, slot) in &pending.set_default {
+        let baseline_d = baseline.defaults.get(mime).cloned();
+        let current_d = current.defaults.get(mime).cloned();
+        if baseline_d == current_d {
+            // External didn't touch this mime's default — safe to apply.
+            continue;
+        }
+        // External touched this mime's default. Compatible with our intent?
+        let ours = slot.clone();
+        let theirs = current_d.clone();
+        match (&ours, &theirs) {
+            // Both cleared (we want None, external also has None) — idempotent.
+            (None, None) => continue,
+            // We want X, external also has X — idempotent.
+            (Some(o), Some(t)) if o == t => continue,
+            // Otherwise: different intents.
+            _ => conflicts.push(MimeConflict {
+                mime: mime.clone(),
+                kind: ConflictKind::DefaultChanged { ours, theirs },
+            }),
+        }
+    }
+
+    // ── add ↔ remove conflicts ──────────────────────────────────────────
+    // We staged "add X to mime"; external recorded "remove X from mime"
+    // somewhere between baseline and now.
+    for (mime, ids) in &pending.add {
+        for id in ids {
+            let baseline_removed = baseline
+                .removed
+                .get(mime)
+                .map(|s| s.contains(id))
+                .unwrap_or(false);
+            let current_removed = current
+                .removed
+                .get(mime)
+                .map(|s| s.contains(id))
+                .unwrap_or(false);
+            if !baseline_removed && current_removed {
+                conflicts.push(MimeConflict {
+                    mime: mime.clone(),
+                    kind: ConflictKind::AddRemoveOpposed {
+                        app_id: id.clone(),
+                        we_added: true,
+                    },
+                });
+            }
+        }
+    }
+    // Mirror: we staged "remove"; external added.
+    for (mime, ids) in &pending.remove {
+        for id in ids {
+            let baseline_added = baseline
+                .added
+                .get(mime)
+                .map(|s| s.contains(id))
+                .unwrap_or(false);
+            let current_added = current
+                .added
+                .get(mime)
+                .map(|s| s.contains(id))
+                .unwrap_or(false);
+            if !baseline_added && current_added {
+                conflicts.push(MimeConflict {
+                    mime: mime.clone(),
+                    kind: ConflictKind::AddRemoveOpposed {
+                        app_id: id.clone(),
+                        we_added: false,
+                    },
+                });
+            }
+        }
+    }
+
+    conflicts
+}
+
+/// Mutate `pending` to drop any edits that conflict with `conflicts`. Used
+/// by the "merge non-conflicting" path in the conflict-resolve modal.
+pub fn drop_conflicting_edits(pending: &mut PendingEdits, conflicts: &[MimeConflict]) {
+    for c in conflicts {
+        match &c.kind {
+            ConflictKind::DefaultChanged { .. } => {
+                pending.set_default.remove(&c.mime);
+            }
+            ConflictKind::AddRemoveOpposed { app_id, we_added } => {
+                if *we_added {
+                    if let Some(set) = pending.add.get_mut(&c.mime) {
+                        set.remove(app_id);
+                        if set.is_empty() {
+                            pending.add.remove(&c.mime);
+                        }
+                    }
+                } else if let Some(set) = pending.remove.get_mut(&c.mime) {
+                    set.remove(app_id);
+                    if set.is_empty() {
+                        pending.remove.remove(&c.mime);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,5 +898,203 @@ mod tests {
         assert!(content.contains("image/png=gimp.desktop;"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Conflict-aware save tests ──────────────────────────────────────
+
+    /// Helper: write a file, snapshot the baseline, return both.
+    fn setup_baseline(prefix: &str, content: &str) -> (PathBuf, UserFileBaseline) {
+        let dir = tempdir(prefix);
+        let path = dir.join("mimeapps.list");
+        fs::write(&path, content).unwrap();
+        let baseline = read_user_file_baseline_at(&path);
+        (path, baseline)
+    }
+
+    #[test]
+    fn safely_save_succeeds_when_disk_unchanged_since_baseline() {
+        let (path, baseline) = setup_baseline(
+            "mime_tui_safe_unchanged",
+            "[Default Applications]\ntext/html=firefox.desktop;\n",
+        );
+        let mut pending = PendingEdits::default();
+        pending.set_default("text/html", Some("chromium.desktop"));
+
+        let result = save_user_file_safely_at(&path, &pending, &baseline);
+        let outcome = result.expect("save should succeed when disk hasn't moved");
+        assert!(!outcome.merged_external_changes);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("text/html=chromium.desktop;"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn safely_save_merges_when_external_touched_unrelated_mime() {
+        // Baseline has text/html only. Externally somebody added image/png
+        // while we were running. Our edit changes text/html. Save should
+        // succeed AND preserve image/png.
+        let (path, baseline) = setup_baseline(
+            "mime_tui_safe_merge",
+            "[Default Applications]\ntext/html=firefox.desktop;\n",
+        );
+        let mut pending = PendingEdits::default();
+        pending.set_default("text/html", Some("chromium.desktop"));
+
+        // Simulate external write.
+        fs::write(
+            &path,
+            "[Default Applications]\n\
+             text/html=firefox.desktop;\n\
+             image/png=gimp.desktop;\n",
+        )
+        .unwrap();
+
+        let outcome = save_user_file_safely_at(&path, &pending, &baseline)
+            .expect("non-conflicting external change should merge");
+        assert!(outcome.merged_external_changes,
+            "outcome should flag that we merged with an external change");
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("text/html=chromium.desktop;"),
+            "our pending edit must be applied"
+        );
+        assert!(
+            content.contains("image/png=gimp.desktop;"),
+            "external image/png entry must be preserved"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn safely_save_detects_conflict_on_overlapping_default() {
+        let (path, baseline) = setup_baseline(
+            "mime_tui_safe_conflict_default",
+            "[Default Applications]\ntext/html=firefox.desktop;\n",
+        );
+        let mut pending = PendingEdits::default();
+        pending.set_default("text/html", Some("chromium.desktop"));
+
+        // External raced us to a different value.
+        fs::write(
+            &path,
+            "[Default Applications]\ntext/html=opera.desktop;\n",
+        )
+        .unwrap();
+
+        let result = save_user_file_safely_at(&path, &pending, &baseline);
+        let conflicts = match result {
+            Err(SaveError::Conflicts(c)) => c,
+            other => panic!("expected SaveError::Conflicts, got {:?}", other),
+        };
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].mime, "text/html");
+        match &conflicts[0].kind {
+            ConflictKind::DefaultChanged { ours, theirs } => {
+                assert_eq!(ours.as_deref(), Some("chromium.desktop"));
+                assert_eq!(theirs.as_deref(), Some("opera.desktop"));
+            }
+            k => panic!("expected DefaultChanged, got {:?}", k),
+        }
+
+        // Critically: the file should NOT have been overwritten.
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("opera.desktop"));
+        assert!(!content.contains("chromium.desktop"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn safely_save_idempotent_when_external_matches_pending() {
+        // Baseline: no default. Pending: set firefox. External: also set
+        // firefox first. Should be a no-conflict idempotent merge.
+        let (path, baseline) = setup_baseline(
+            "mime_tui_safe_idempotent",
+            "[Default Applications]\n",
+        );
+        let mut pending = PendingEdits::default();
+        pending.set_default("text/html", Some("firefox.desktop"));
+
+        fs::write(
+            &path,
+            "[Default Applications]\ntext/html=firefox.desktop;\n",
+        )
+        .unwrap();
+
+        let outcome = save_user_file_safely_at(&path, &pending, &baseline)
+            .expect("idempotent match should be no-conflict");
+        assert!(outcome.merged_external_changes);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("text/html=firefox.desktop;"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn safely_save_conflict_on_add_vs_remove() {
+        // We're trying to ADD krita to image/png's associations. Externally
+        // someone REMOVED krita from image/png. Opposing intents → conflict.
+        let (path, baseline) = setup_baseline(
+            "mime_tui_safe_add_remove",
+            "[Added Associations]\nimage/png=other.desktop;\n",
+        );
+        let mut pending = PendingEdits::default();
+        pending.add_assoc("image/png", "krita.desktop");
+
+        fs::write(
+            &path,
+            "[Added Associations]\n\
+             image/png=other.desktop;\n\
+             \n\
+             [Removed Associations]\n\
+             image/png=krita.desktop;\n",
+        )
+        .unwrap();
+
+        let result = save_user_file_safely_at(&path, &pending, &baseline);
+        let conflicts = match result {
+            Err(SaveError::Conflicts(c)) => c,
+            other => panic!("expected SaveError::Conflicts, got {:?}", other),
+        };
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].mime, "image/png");
+        match &conflicts[0].kind {
+            ConflictKind::AddRemoveOpposed { app_id, we_added } => {
+                assert_eq!(app_id, "krita.desktop");
+                assert!(we_added);
+            }
+            k => panic!("expected AddRemoveOpposed, got {:?}", k),
+        }
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn drop_conflicting_edits_removes_just_the_conflicting_keys() {
+        // Pending has two default edits + one add. Conflict list mentions
+        // only one of the defaults. The other two pending edits should
+        // survive the drop.
+        let mut pending = PendingEdits::default();
+        pending.set_default("text/html", Some("firefox.desktop"));
+        pending.set_default("image/png", Some("gimp.desktop"));
+        pending.add_assoc("video/mp4", "vlc.desktop");
+
+        let conflicts = vec![MimeConflict {
+            mime: "text/html".into(),
+            kind: ConflictKind::DefaultChanged {
+                ours: Some("firefox.desktop".into()),
+                theirs: Some("opera.desktop".into()),
+            },
+        }];
+
+        drop_conflicting_edits(&mut pending, &conflicts);
+        assert!(!pending.set_default.contains_key("text/html"));
+        assert!(pending.set_default.contains_key("image/png"));
+        assert!(pending.add.contains_key("video/mp4"));
     }
 }

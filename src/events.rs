@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::EventHandler;
 
-use crate::app::{App, Focus, Mode, View};
+use crate::app::{App, Focus, Mode, SaveResult, View};
 
 /// Returns Ok(true) when the app should exit cleanly.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
@@ -15,6 +15,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         Mode::PickApp { .. } | Mode::PickMime { .. } => handle_key_picker(app, key),
         Mode::ConfirmQuit => Ok(handle_key_confirm_quit(app, key)),
         Mode::Help => Ok(handle_key_help(app, key)),
+        Mode::ConflictResolve { conflicts } => {
+            Ok(handle_key_conflict_resolve(app, key, &conflicts))
+        }
+        Mode::ThemePick { selected, .. } => {
+            Ok(handle_key_theme_pick(app, key, selected))
+        }
     }
 }
 
@@ -32,6 +38,11 @@ fn handle_key_browse(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.action_discard();
                 app.set_flash("Discarded pending edits.");
             }
+            return Ok(false);
+        }
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            // Open the live theme preview.
+            app.open_theme_pick();
             return Ok(false);
         }
         _ => {}
@@ -382,8 +393,11 @@ fn do_save(app: &mut App) {
         return;
     }
     match app.save() {
-        Ok((n, shadowed)) => {
-            let mut msg = format!("Saved {} edit(s) to mimeapps.list", n);
+        Ok(SaveResult::Saved { written, shadowed, merged_external }) => {
+            let mut msg = format!("Saved {} edit(s) to mimeapps.list", written);
+            if merged_external {
+                msg.push_str(" — merged with concurrent external changes");
+            }
             if !shadowed.is_empty() {
                 msg.push_str(&format!(
                     " — {} default{} shadowed by a per-desktop override (see detail pane)",
@@ -392,6 +406,14 @@ fn do_save(app: &mut App) {
                 ));
             }
             app.set_flash(msg);
+        }
+        Ok(SaveResult::Conflicts(conflicts)) => {
+            app.set_flash(format!(
+                "mimeapps.list changed externally — {} conflict{} (see modal)",
+                conflicts.len(),
+                if conflicts.len() == 1 { "" } else { "s" },
+            ));
+            app.mode = Mode::ConflictResolve { conflicts };
         }
         Err(e) => app.set_flash(format!("Save failed: {}", e)),
     }
@@ -557,6 +579,124 @@ fn handle_key_help(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+// ───────────── ConflictResolve ───────────────────────────────────────────────
+
+fn handle_key_conflict_resolve(
+    app: &mut App,
+    key: KeyEvent,
+    conflicts: &[crate::storage::mimeapps::MimeConflict],
+) -> bool {
+    match key.code {
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            // Reload: discard pending, take the on-disk state as gospel.
+            app.reload_from_disk();
+            app.mode = Mode::Browse;
+            app.set_flash("Discarded pending edits; reloaded from disk.");
+            false
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            // Overwrite: clobber external changes.
+            match app.save_force() {
+                Ok((n, _shadowed)) => {
+                    app.mode = Mode::Browse;
+                    app.set_flash(format!(
+                        "Force-saved {} edit(s); external changes were overwritten.",
+                        n
+                    ));
+                }
+                Err(e) => app.set_flash(format!("Force save failed: {}", e)),
+            }
+            false
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            // Merge: drop the conflicting pending edits, save the rest.
+            let dropped = conflicts.len();
+            match app.save_dropping_conflicts(conflicts) {
+                Ok(SaveResult::Saved { written, .. }) => {
+                    app.mode = Mode::Browse;
+                    app.set_flash(format!(
+                        "Saved {} edit(s); dropped {} conflicting one{}.",
+                        written,
+                        dropped,
+                        if dropped == 1 { "" } else { "s" },
+                    ));
+                }
+                Ok(SaveResult::Conflicts(remaining)) => {
+                    // Shouldn't happen — drop_conflicting_edits cleared them
+                    // — but route to a fresh ConflictResolve just in case.
+                    app.mode = Mode::ConflictResolve { conflicts: remaining };
+                }
+                Err(e) => app.set_flash(format!("Merge save failed: {}", e)),
+            }
+            false
+        }
+        KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
+            // Cancel: keep pending in memory, dismiss the modal.
+            app.mode = Mode::Browse;
+            false
+        }
+        _ => false,
+    }
+}
+
+// ───────────── ThemePick ─────────────────────────────────────────────────────
+
+fn handle_key_theme_pick(app: &mut App, key: KeyEvent, selected: usize) -> bool {
+    let count = crate::config::PRESET_NAMES.len();
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if selected > 0 {
+                app.preview_theme(selected - 1);
+            }
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if selected + 1 < count {
+                app.preview_theme(selected + 1);
+            }
+            false
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.preview_theme(0);
+            false
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            if count > 0 {
+                app.preview_theme(count - 1);
+            }
+            false
+        }
+        KeyCode::Enter => {
+            // Commit the preview — keep the new theme and persist the
+            // preset name into the user's mime-tui.toml so the choice
+            // survives the next launch. Falls back to a session-only flash
+            // if the disk write fails (read-only home, missing XDG dirs,
+            // etc.).
+            app.close_theme_pick(false);
+            let name = app
+                .active_preset
+                .clone()
+                .unwrap_or_else(|| "default-dark".into());
+            match crate::config::save_preset_to_config(&name) {
+                Ok(()) => app.set_flash(format!(
+                    "Saved theme '{}' to ~/.config/mime-tui/mime-tui.toml",
+                    name
+                )),
+                Err(e) => app.set_flash(format!(
+                    "Theme kept for this session — couldn't update config: {}",
+                    e
+                )),
+            }
+            false
+        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            app.close_theme_pick(true);
+            false
+        }
+        _ => false,
+    }
+}
+
 // ───────────── ConfirmQuit ───────────────────────────────────────────────────
 
 fn handle_key_confirm_quit(app: &mut App, key: KeyEvent) -> bool {
@@ -625,12 +765,42 @@ fn forward_to_input(input: &mut tui_input::Input, key: KeyEvent) {
     }
 }
 
-// ───────────── Mouse (Phase 3: same scope as Phase 2) ────────────────────────
+// ───────────── Mouse ────────────────────────────────────────────────────────
+
+const WHEEL_STEP: usize = 3;
 
 pub fn handle_mouse(app: &mut App, ev: MouseEvent) -> Result<bool> {
-    if app.mode != Mode::Browse {
-        return Ok(false);
+    match app.mode.clone() {
+        Mode::Browse => handle_mouse_browse(app, ev),
+        Mode::PickApp { .. } | Mode::PickMime { .. } => handle_mouse_picker(app, ev),
+        Mode::Help => Ok(handle_mouse_help(app, ev)),
+        Mode::ThemePick { selected, .. } => {
+            Ok(handle_mouse_theme_pick(app, ev, selected))
+        }
+        // These modals are small and decision-focused — keyboard-only.
+        Mode::ConfirmQuit | Mode::ConflictResolve { .. } => Ok(false),
     }
+}
+
+fn handle_mouse_theme_pick(app: &mut App, ev: MouseEvent, selected: usize) -> bool {
+    let count = crate::config::PRESET_NAMES.len();
+    match ev.kind {
+        MouseEventKind::ScrollUp => {
+            if selected > 0 {
+                app.preview_theme(selected - 1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if selected + 1 < count {
+                app.preview_theme(selected + 1);
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn handle_mouse_browse(app: &mut App, ev: MouseEvent) -> Result<bool> {
     let (col, row) = (ev.column, ev.row);
 
     match ev.kind {
@@ -670,33 +840,109 @@ pub fn handle_mouse(app: &mut App, ev: MouseEvent) -> Result<bool> {
             }
         }
         MouseEventKind::ScrollUp => {
-            if let Some(rect) = app.left_rect {
+            // Scroll wherever the cursor is. Right pane scroll moves
+            // selected_right; everywhere else (including search bar) moves
+            // selected_left, since the left list is the primary surface.
+            if let Some(rect) = app.right_rect {
                 if rect_contains(rect, col, row) {
-                    for _ in 0..3 {
-                        if app.selected_left > 0 {
-                            app.selected_left -= 1;
-                        }
-                    }
+                    scroll_right_pane(app, -(WHEEL_STEP as isize));
                     return Ok(false);
                 }
             }
+            scroll_left_pane(app, -(WHEEL_STEP as isize));
+            return Ok(false);
         }
         MouseEventKind::ScrollDown => {
-            if let Some(rect) = app.left_rect {
+            if let Some(rect) = app.right_rect {
                 if rect_contains(rect, col, row) {
-                    let count = left_pane_count(app);
-                    for _ in 0..3 {
-                        if count > 0 && app.selected_left + 1 < count {
-                            app.selected_left += 1;
-                        }
-                    }
+                    scroll_right_pane(app, WHEEL_STEP as isize);
                     return Ok(false);
                 }
             }
+            scroll_left_pane(app, WHEEL_STEP as isize);
+            return Ok(false);
         }
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_mouse_picker(app: &mut App, ev: MouseEvent) -> Result<bool> {
+    let (col, row) = (ev.column, ev.row);
+    let Some(rect) = app.pick_list_rect else {
+        return Ok(false);
+    };
+
+    match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if rect_contains(rect, col, row) {
+                if let Some(target) = click_row_in_list(rect, col, row) {
+                    let offset = app.pick_list_state.offset();
+                    let display_idx = offset + target;
+                    if display_idx < picker_visible_count(app) {
+                        app.pick_selected = display_idx;
+                    }
+                }
+            }
+            Ok(false)
+        }
+        MouseEventKind::ScrollUp => {
+            if rect_contains(rect, col, row) {
+                app.pick_selected = app.pick_selected.saturating_sub(WHEEL_STEP);
+            }
+            Ok(false)
+        }
+        MouseEventKind::ScrollDown => {
+            if rect_contains(rect, col, row) {
+                let count = picker_visible_count(app);
+                if count > 0 {
+                    app.pick_selected = (app.pick_selected + WHEEL_STEP).min(count - 1);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn handle_mouse_help(app: &mut App, ev: MouseEvent) -> bool {
+    // Don't bother hit-testing inside the overlay — the help fills most of
+    // the screen and any scroll anywhere should drive the overlay (no other
+    // surface is interactive while help is up).
+    match ev.kind {
+        MouseEventKind::ScrollUp => {
+            app.help_scroll = app.help_scroll.saturating_sub(WHEEL_STEP as u16);
+        }
+        MouseEventKind::ScrollDown => {
+            app.help_scroll = app.help_scroll.saturating_add(WHEEL_STEP as u16);
+        }
+        _ => {}
+    }
+    false
+}
+
+fn scroll_left_pane(app: &mut App, delta: isize) {
+    if delta < 0 {
+        app.selected_left = app.selected_left.saturating_sub((-delta) as usize);
+        return;
+    }
+    let count = left_pane_count(app);
+    if count == 0 {
+        return;
+    }
+    app.selected_left = (app.selected_left + delta as usize).min(count - 1);
+}
+
+fn scroll_right_pane(app: &mut App, delta: isize) {
+    if delta < 0 {
+        app.selected_right = app.selected_right.saturating_sub((-delta) as usize);
+        return;
+    }
+    let count = right_pane_count(app);
+    if count == 0 {
+        return;
+    }
+    app.selected_right = (app.selected_right + delta as usize).min(count - 1);
 }
 
 fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {

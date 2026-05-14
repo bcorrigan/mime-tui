@@ -8,7 +8,9 @@ mod by_mime;
 mod confirm;
 mod help;
 mod picker;
+mod save_conflict;
 mod status;
+mod theme_pick;
 
 pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
     let (search_area, rest) = layout::vertical_split(f, 3, config.search_position.clone());
@@ -28,10 +30,16 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
     status::draw(f, app, status_area, config);
 
     // Overlays render on top, last.
-    match app.mode {
+    match app.mode.clone() {
         Mode::PickApp { .. } | Mode::PickMime { .. } => picker::draw(f, app, config),
         Mode::ConfirmQuit => confirm::draw(f, app, config),
         Mode::Help => help::draw(f, app, config),
+        Mode::ConflictResolve { conflicts } => {
+            save_conflict::draw(f, &conflicts, config)
+        }
+        Mode::ThemePick { selected, .. } => {
+            theme_pick::draw(f, app, selected, config)
+        }
         Mode::Browse => {}
     }
 }

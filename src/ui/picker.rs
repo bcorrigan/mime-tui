@@ -22,7 +22,15 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
                 .enumerate()
                 .map(|(i, a)| {
                     let rel = app.relation_of(&for_mime, &a.id);
-                    build_row(rel, in_marked_range(app, i), &a.name, &a.id, secondary)
+                    let mstyle = marker_style(rel, config);
+                    build_row(
+                        rel,
+                        in_marked_range(app, i),
+                        &a.name,
+                        &a.id,
+                        secondary,
+                        mstyle,
+                    )
                 })
                 .collect();
             (format!(" Toggle apps for {} ", for_mime), items)
@@ -35,7 +43,15 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
                 .enumerate()
                 .map(|(i, m)| {
                     let rel = app.relation_of(&m.id, &for_app);
-                    build_row(rel, in_marked_range(app, i), &m.id, &m.description, secondary)
+                    let mstyle = marker_style(rel, config);
+                    build_row(
+                        rel,
+                        in_marked_range(app, i),
+                        &m.id,
+                        &m.description,
+                        secondary,
+                        mstyle,
+                    )
                 })
                 .collect();
             (format!(" Toggle mime types for {} ", for_app), items)
@@ -50,11 +66,13 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
     let key = Style::default().add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Theme::parse_color(&config.colors.unfocused));
 
+    let text = layout::theme_text_style(config);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border));
+        .border_style(Style::default().fg(border))
+        .style(text);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -80,7 +98,7 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
 
     let visible_items: Vec<Line<'static>> = items
         .iter()
-        .map(|l| scroll_line(l, hscroll as usize))
+        .map(|l| layout::scroll_line(l, hscroll as usize, 2))
         .collect();
 
     let clamped = app.pick_selected.min(visible_items.len().saturating_sub(1));
@@ -94,6 +112,8 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
         config,
         &mut app.pick_list_state,
     );
+    // Remember the list rect so mouse handlers can hit-test it.
+    app.pick_list_rect = Some(chunks[1]);
     layout::render_list_hscrollbar(
         f,
         chunks[1],
@@ -122,18 +142,26 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
             Span::styled(": close", dim),
         ])
     };
-    f.render_widget(Paragraph::new(hint), chunks[2]);
+    f.render_widget(Paragraph::new(hint).style(text), chunks[2]);
 }
 
-/// Build a single picker row as a Line with three logical parts:
-/// `[rel][mark] primary    secondary` — where the secondary span carries a
-/// themed style so it visually de-emphasises against the primary text.
+/// Build a single picker row as a Line with four logical parts:
+///
+/// `[rel] [mark+sep] primary    secondary`
+///
+/// Span 0 carries the relation marker styled with `marker_style` so each row
+/// gets a per-relation colour (★ / ✓ / · all distinct). Span 1 is the mark
+/// indicator + trailing space, raw, so the bg-only emacs-mark glyph keeps
+/// its own (uncoloured) look. Together these two spans form the 3-column
+/// prefix that `layout::scroll_line` pins when the row is horizontally
+/// scrolled.
 fn build_row(
     rel: Option<Relation>,
     marked: bool,
     primary: &str,
     secondary: &str,
     secondary_style: Style,
+    marker_style: Style,
 ) -> Line<'static> {
     let rel_char = match rel {
         Some(Relation::Default) => '★',
@@ -142,10 +170,10 @@ fn build_row(
         None => ' ',
     };
     let mark_char = if marked { '▌' } else { ' ' };
-    let prefix = format!("{}{} ", rel_char, mark_char);
 
     let mut spans: Vec<Span<'static>> = vec![
-        Span::raw(prefix),
+        Span::styled(rel_char.to_string(), marker_style),
+        Span::raw(format!("{} ", mark_char)),
         Span::raw(primary.to_string()),
     ];
     if !secondary.is_empty() {
@@ -155,40 +183,17 @@ fn build_row(
     Line::from(spans)
 }
 
-/// Drop the first `hscroll` columns from the line, but keep span[0] (the
-/// relation+mark prefix) pinned at column 0 so the user retains visual
-/// context while scrolling. Char-width is approximated as 1 per char —
-/// acceptable for mime ids and app names, which are ~always ASCII.
-fn scroll_line(line: &Line<'static>, hscroll: usize) -> Line<'static> {
-    if hscroll == 0 || line.spans.is_empty() {
-        return line.clone();
-    }
-    let prefix = line.spans[0].clone();
-    let rest = &line.spans[1..];
-
-    let mut consumed: usize = 0;
-    let mut new_spans: Vec<Span<'static>> = vec![prefix];
-
-    for span in rest {
-        let span_w = span.width();
-        if consumed + span_w <= hscroll {
-            // Whole span is to the left of the visible area — skip.
-            consumed += span_w;
-            continue;
-        }
-        if consumed >= hscroll {
-            // Entire span is visible — pass through.
-            new_spans.push(span.clone());
-        } else {
-            // Span straddles the scroll boundary; keep its tail.
-            let skip_chars = hscroll - consumed;
-            let tail: String = span.content.as_ref().chars().skip(skip_chars).collect();
-            new_spans.push(Span::styled(tail, span.style));
-            consumed += span_w;
-        }
-    }
-
-    Line::from(new_spans)
+/// Pick the per-marker foreground colour. `None` (no relationship) gets
+/// the default style so the leading column of an unrelated row is just an
+/// uncoloured space.
+fn marker_style(rel: Option<Relation>, config: &MimeTuiConfig) -> Style {
+    let colour_field = match rel {
+        Some(Relation::Default) => &config.colors.marker_default,
+        Some(Relation::Associated) => &config.colors.marker_associated,
+        Some(Relation::DeclaredOnly) => &config.colors.marker_declared_only,
+        None => return Style::default(),
+    };
+    Style::default().fg(Theme::parse_color(colour_field))
 }
 
 fn in_marked_range(app: &App, i: usize) -> bool {
@@ -227,7 +232,7 @@ mod tests {
     #[test]
     fn zero_hscroll_returns_unchanged_line() {
         let line = sample_row();
-        let out = scroll_line(&line, 0);
+        let out = layout::scroll_line(&line, 0, 1);
         assert_eq!(line_text(&out), line_text(&line));
     }
 
@@ -235,7 +240,7 @@ mod tests {
     fn prefix_stays_pinned_when_scrolling() {
         // Scroll past the primary text entirely.
         let line = sample_row();
-        let out = scroll_line(&line, 100);
+        let out = layout::scroll_line(&line, 100, 1);
         // First span must still be the prefix.
         let first = &out.spans[0];
         assert_eq!(first.content.as_ref(), "★ ");
@@ -246,7 +251,7 @@ mod tests {
         let line = sample_row();
         // hscroll = 5 → skip 5 chars from "text/html" + onward.
         // "text/html" is 9 chars; first 5 chars dropped → "html".
-        let out = scroll_line(&line, 5);
+        let out = layout::scroll_line(&line, 5, 1);
         let text = line_text(&out);
         // Prefix is intact, then "html" (rest of primary), then separator,
         // then secondary.
@@ -260,7 +265,7 @@ mod tests {
     fn hscroll_can_remove_entire_spans() {
         let line = sample_row();
         // "text/html" (9) + "    " (4) = 13 — skip all of those, land at "HTML…".
-        let out = scroll_line(&line, 13);
+        let out = layout::scroll_line(&line, 13, 1);
         let text = line_text(&out);
         assert!(text.starts_with("★ "));
         assert!(text.contains("HTML document"));
@@ -270,7 +275,7 @@ mod tests {
     #[test]
     fn hscroll_past_everything_leaves_only_prefix() {
         let line = sample_row();
-        let out = scroll_line(&line, 9999);
+        let out = layout::scroll_line(&line, 9999, 1);
         assert_eq!(line_text(&out), "★ ");
     }
 
@@ -281,7 +286,7 @@ mod tests {
             Span::raw("p "),                          // prefix
             Span::styled("abcdef", style),            // primary, bolded
         ]);
-        let out = scroll_line(&line, 3);
+        let out = layout::scroll_line(&line, 3, 1);
         // We skipped 3 chars of "abcdef" → "def"; style must follow.
         let trimmed_span = &out.spans[1];
         assert_eq!(trimmed_span.content.as_ref(), "def");

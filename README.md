@@ -91,20 +91,80 @@ Press **`?`** at any time for the full reference. The most useful ones:
 ## Configuration
 
 `mime-tui` looks for `~/.config/mime-tui/mime-tui.toml`. Every field is
-optional - all fields & their default values listed below.
+optional. The simplest config picks a preset:
+
+```toml
+preset = "gruvbox-dark"
+```
+
+### Shipped presets
+
+| Preset             | Notes                                                       |
+| ------------------ | ----------------------------------------------------------- |
+| `default-dark`     | The built-in defaults — white borders, green focus, gold ★. |
+| `default-light`    | For light-background terminals — dark borders, amber ★.     |
+| `gruvbox-dark`     | Warm earthy palette; ★ in bright orange.                    |
+| `solarized-light`  | Cream background, muted blue accents.                       |
+| `dracula`          | Signature purple focus + vivid markers.                     |
+| `nord`             | Cool frost / aurora palette.                                |
+| `monokai`          | Vivid neon — ★ in pink.                                     |
+
+### Overrides
+
+Individual `[theme]` fields override the preset:
+
+```toml
+preset = "dracula"
+
+[theme]
+focus = "#ff0000"           # override just one knob; rest stays dracula
+```
+
+### Full theme reference
 
 ```toml
 search_position = "top"     # or "bottom"
 timeout = 0                 # auto-exit after N idle seconds; 0 disables
+preset = "default-dark"     # see table above
 
 [theme]
 border        = "#ffffff"
 focus         = "#00ff00"   # focused border + heading colour
-unfocused     = "#808080"
-highlight     = "#ffd700"   # selection-bar background
+unfocused     = "#808080"   # selection-bar background of an UNfocused list
+highlight     = "#ffd700"   # selection-bar background of a focused list
+secondary     = "#808080"   # de-emphasised text (e.g. ".desktop" ids in picker)
+selection_fg  = "#000000"   # foreground drawn on top of the selection bar
 border_style  = "rounded"   # plain | rounded | thick | double
 cursor_shape  = "block"     # block | underline | pipe
+
+# Scrollbar — both fall back to focus/unfocused respectively when blank.
+scrollbar_thumb = ""
+scrollbar_track = ""
+
+# Relation markers in the picker and by-app right pane. Empty fields
+# fall back: marker_default→highlight, marker_associated→focus,
+# marker_declared_only→secondary. Override for stronger contrast on the
+# selection bar, or just to match your terminal palette.
+marker_default       = ""   # the ★ glyph
+marker_associated    = ""   # the ✓ glyph
+marker_declared_only = ""   # the · glyph
 ```
+
+### Colour syntax
+
+Each colour field accepts:
+
+- **Hex**: `"#ff8800"` / `"#f80"` / `"#ff8800aa"` (alpha ignored).
+- **ANSI named**: `"red"`, `"green"`, `"yellow"`, `"blue"`, `"magenta"`,
+  `"cyan"`, `"white"`, `"black"`, `"gray"`, plus `"bright_*"` /
+  `"light_*"` / `"dark_gray"` variants. The terminal emulator picks the
+  actual RGB — convenient for matching your terminal palette.
+- **`"reset"`** / **`"default"`** / **`""`**: the terminal's default
+  foreground or background. Useful for keeping `mime-tui` visually quiet
+  in your shell.
+
+Mix freely: `border = "reset"`, `focus = "bright_green"`,
+`highlight = "#ffaa00"` is a valid combination.
 
 ## Files written
 

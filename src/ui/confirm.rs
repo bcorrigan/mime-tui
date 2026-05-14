@@ -20,11 +20,13 @@ pub fn draw(f: &mut Frame, app: &App, config: &MimeTuiConfig) {
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Theme::parse_color(&config.colors.unfocused));
 
+    let text = crate::ui::layout::theme_text_style(config);
     let block = Block::default()
         .title(" Unsaved changes ")
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border));
+        .border_style(Style::default().fg(border))
+        .style(text);
 
     let body = vec![
         Line::from(""),
@@ -51,7 +53,10 @@ pub fn draw(f: &mut Frame, app: &App, config: &MimeTuiConfig) {
         ]),
     ];
 
-    let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(body)
+        .block(block)
+        .style(text)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 

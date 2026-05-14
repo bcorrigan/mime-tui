@@ -35,9 +35,12 @@ pub fn required_height(app: &App, config: &MimeTuiConfig, width: u16) -> u16 {
 }
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect, config: &MimeTuiConfig) {
+    let text = crate::ui::layout::theme_text_style(config);
     if app.flash_message().is_some() {
         f.render_widget(
-            Paragraph::new(build_flash_line(app, config)).wrap(Wrap { trim: false }),
+            Paragraph::new(build_flash_line(app, config))
+                .style(text)
+                .wrap(Wrap { trim: false }),
             area,
         );
         return;
@@ -45,7 +48,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect, config: &MimeTuiConfig) {
     let lines = layout_chunks(build_chunks(app, config), area.width);
     // Plain Paragraph — no `.wrap()` because we've already wrapped manually
     // at chunk boundaries.
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(Paragraph::new(lines).style(text), area);
 }
 
 fn build_flash_line(app: &App, config: &MimeTuiConfig) -> Line<'static> {
@@ -94,6 +97,17 @@ fn build_chunks(app: &App, config: &MimeTuiConfig) -> Vec<Chunk> {
             chunks.push(kv_chunk("↑/↓", ":line", key, dim));
             chunks.push(kv_chunk("q/Esc", ":close", key, dim));
         }
+        Mode::ConflictResolve { .. } => {
+            chunks.push(kv_chunk("r", ":reload", key, dim));
+            chunks.push(kv_chunk("o", ":overwrite", key, dim));
+            chunks.push(kv_chunk("m", ":merge", key, dim));
+            chunks.push(kv_chunk("c/Esc", ":cancel", key, dim));
+        }
+        Mode::ThemePick { .. } => {
+            chunks.push(kv_chunk("↑↓", ":preview", key, dim));
+            chunks.push(kv_chunk("Enter", ":keep", key, dim));
+            chunks.push(kv_chunk("Esc", ":cancel", key, dim));
+        }
     }
 
     chunks
@@ -120,6 +134,7 @@ fn browse_chunks(chunks: &mut Vec<Chunk>, app: &App, key: Style, dim: Style) {
     if app.is_dirty() {
         chunks.push(kv_chunk("Ctrl-Z", ":discard", key, dim));
     }
+    chunks.push(kv_chunk("Ctrl-T", ":theme", key, dim));
     chunks.push(kv_chunk("?", ":help", key, dim));
     chunks.push(kv_chunk("Esc", ":quit", key, dim));
 }

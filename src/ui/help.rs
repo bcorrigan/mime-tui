@@ -36,14 +36,19 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
         scroll_indicator(scroll, max_scroll)
     );
 
+    let text = crate::ui::layout::theme_text_style(config);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border));
+        .border_style(Style::default().fg(border))
+        .style(text);
 
     f.render_widget(
-        Paragraph::new(lines).block(block).scroll((scroll, 0)),
+        Paragraph::new(lines)
+            .block(block)
+            .style(text)
+            .scroll((scroll, 0)),
         area,
     );
 
@@ -266,6 +271,11 @@ fn build_lines(ctx: &HelpContext, config: &MimeTuiConfig, width: u16) -> Vec<Lin
             "Esc / Ctrl-C / Ctrl-G",
             "Quit the application. If you have unsaved edits, you're prompted: \
              y = discard & quit, s = save & quit, n = cancel.",
+        ),
+        (
+            "Ctrl-T",
+            "Open the theme picker. Arrows preview each shipped theme live; \
+             Enter keeps it for this session (not saved to disk); Esc reverts.",
         ),
     ];
     for (k, v) in always {

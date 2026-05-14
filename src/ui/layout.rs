@@ -6,11 +6,18 @@ use ratatui::{
         Block, Borders, List, ListItem, ListState, Paragraph,
         Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
-    style::{Style, Color},
+    style::Style,
 };
 use tui_input::Input;
 use crate::app::Focus;
 use crate::config::{MimeTuiConfig, Theme, SearchPosition};
+
+/// Base text style for the current theme. Apply to Block.style /
+/// Paragraph.style / List.style so plain (`Span::raw`) text picks up the
+/// configured foreground; styled spans override per-span.
+pub fn theme_text_style(config: &MimeTuiConfig) -> Style {
+    Style::default().fg(Theme::parse_color(&config.colors.text))
+}
 
 pub fn vertical_split(f: &Frame, search_height: u16, search_position: SearchPosition) -> (Rect, Rect) {
     let full_area = f.area();
@@ -62,17 +69,20 @@ pub fn render_description(
     f: &mut Frame,
     area: Rect,
     title: &str,
-    text: &str,
+    body: &str,
     config: &MimeTuiConfig,
 ) {
     let border_color = Theme::parse_color(&config.colors.border);
+    let text_style = theme_text_style(config);
     let block = Block::default()
         .title(format!(" {} ", title))
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border_color));
-    let paragraph = Paragraph::new(text)
+        .border_style(Style::default().fg(border_color))
+        .style(text_style);
+    let paragraph = Paragraph::new(body)
         .block(block)
+        .style(text_style)
         .wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
@@ -90,11 +100,13 @@ pub fn render_search_bar(
         Theme::parse_color(&config.colors.border)
     };
 
+    let text = theme_text_style(config);
     let block = Block::default()
         .title(" Search ")
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(text);
 
     let inner = block.inner(area);
 
@@ -119,9 +131,7 @@ pub fn render_search_bar(
 
     let padded_text = format!(" {} ", visible_text);
 
-    let paragraph = Paragraph::new(padded_text)
-        .block(block)
-        .style(Style::default().fg(border_color));
+    let paragraph = Paragraph::new(padded_text).block(block).style(text);
 
     f.render_widget(paragraph, area);
 
@@ -156,12 +166,14 @@ pub fn render_list(
     } else {
         Theme::parse_color(&config.colors.border)
     };
+    let text = theme_text_style(config);
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(text);
 
     let list_items: Vec<ListItem> = items.iter()
         .map(|a| ListItem::new(format!(" {} ", a)))
@@ -175,11 +187,14 @@ pub fn render_list(
 
     let highlight_style = match config.colors.highlight_type.to_lowercase().as_str() {
         "foreground" => Style::default().fg(selection_color),
-        "background" | _ => Style::default().bg(selection_color).fg(Color::Black),
+        "background" | _ => Style::default()
+            .bg(selection_color)
+            .fg(Theme::parse_color(&config.colors.selection_fg)),
     };
 
     let list = List::new(list_items)
         .block(block)
+        .style(text)
         .highlight_style(highlight_style)
         .highlight_symbol("");
 
@@ -289,6 +304,47 @@ pub fn render_list_hscrollbar(
     f.render_stateful_widget(scrollbar, area, &mut sb_state);
 }
 
+/// Drop the first `hscroll` columns from `line`, but keep the first
+/// `pin_count` spans intact at column 0 so contextual prefixes (e.g.
+/// relation markers, mark indicators) stay visible while scrolling.
+/// Char-width is approximated as 1 per char — acceptable for mime ids and
+/// app names, which are almost always ASCII.
+pub fn scroll_line(
+    line: &Line<'static>,
+    hscroll: usize,
+    pin_count: usize,
+) -> Line<'static> {
+    if hscroll == 0 || line.spans.is_empty() {
+        return line.clone();
+    }
+    let pin_count = pin_count.min(line.spans.len());
+    let mut new_spans: Vec<Span<'static>> =
+        line.spans.iter().take(pin_count).cloned().collect();
+    let rest = &line.spans[pin_count..];
+
+    let mut consumed: usize = 0;
+    for span in rest {
+        let span_w = span.width();
+        if consumed + span_w <= hscroll {
+            // Entire span lies before the scroll point — skip.
+            consumed += span_w;
+            continue;
+        }
+        if consumed >= hscroll {
+            // Span is fully visible — include as-is.
+            new_spans.push(span.clone());
+        } else {
+            // Span straddles the scroll boundary; keep its tail.
+            let skip_chars = hscroll - consumed;
+            let tail: String = span.content.as_ref().chars().skip(skip_chars).collect();
+            new_spans.push(Span::styled(tail, span.style));
+            consumed += span_w;
+        }
+    }
+
+    Line::from(new_spans)
+}
+
 /// Same as `render_list` but accepts pre-styled `Line` items — used by the
 /// picker so each row can carry mixed-style spans (e.g. a primary app name
 /// followed by a dimmed `.desktop` id).
@@ -315,12 +371,14 @@ pub fn render_list_lines(
     } else {
         Theme::parse_color(&config.colors.border)
     };
+    let text = theme_text_style(config);
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(text);
 
     let list_items: Vec<ListItem> = items
         .iter()
@@ -343,11 +401,14 @@ pub fn render_list_lines(
 
     let highlight_style = match config.colors.highlight_type.to_lowercase().as_str() {
         "foreground" => Style::default().fg(selection_color),
-        "background" | _ => Style::default().bg(selection_color).fg(Color::Black),
+        "background" | _ => Style::default()
+            .bg(selection_color)
+            .fg(Theme::parse_color(&config.colors.selection_fg)),
     };
 
     let list = List::new(list_items)
         .block(block)
+        .style(text)
         .highlight_style(highlight_style)
         .highlight_symbol("");
 

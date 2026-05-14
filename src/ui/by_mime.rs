@@ -112,11 +112,13 @@ fn render_summary(
         .map(|m| format!(" {} ", m.id))
         .unwrap_or_else(|| " — ".into());
 
+    let text = layout::theme_text_style(config);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(text);
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(m) = mime {
@@ -154,7 +156,10 @@ fn render_summary(
     }
 
     f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .style(text)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }

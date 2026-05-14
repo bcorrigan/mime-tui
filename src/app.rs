@@ -8,9 +8,10 @@ use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use tui_input::Input;
 
-use crate::config::MimeTuiConfig;
+use crate::config::{MimeTuiConfig, Theme};
 use crate::model::{DesktopApp, MimeType, OnDiskAssoc, PendingEdits};
 use crate::storage::{self, Storage};
+use crate::storage::mimeapps::{MimeConflict, SaveError, UserFileBaseline};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -38,6 +39,29 @@ pub enum Mode {
     ConfirmQuit,
     /// Help overlay listing all keybindings.
     Help,
+    /// Save was attempted but the user's `mimeapps.list` changed on disk
+    /// since startup and at least one pending edit overlaps with that
+    /// change. User picks: reload / overwrite / merge / cancel.
+    ConflictResolve { conflicts: Vec<MimeConflict> },
+    /// Live theme-preview picker. Carries the colours we started with so
+    /// Esc can revert; `selected` is the index into `config::PRESET_NAMES`.
+    ThemePick {
+        original_colors: Theme,
+        selected: usize,
+    },
+}
+
+/// Result of `App::save`. The wrapping `Result<_, eyre::Report>` only
+/// signals I/O / parse errors; user-actionable outcomes (a clean write vs
+/// a conflict needing resolution) live here.
+#[derive(Debug)]
+pub enum SaveResult {
+    Saved {
+        written: usize,
+        shadowed: Vec<String>,
+        merged_external: bool,
+    },
+    Conflicts(Vec<MimeConflict>),
 }
 
 /// How an app relates to a mime in the by-app right pane. Drives display
@@ -65,6 +89,10 @@ pub struct App {
     pub apps: Vec<DesktopApp>,
     pub mimes: Vec<MimeType>,
     pub assoc: OnDiskAssoc,
+    /// Snapshot of the user's `mimeapps.list` at startup. Conflict detection
+    /// at save time compares this against the current on-disk file to spot
+    /// external edits that landed mid-session.
+    pub user_baseline: UserFileBaseline,
     pub pending: PendingEdits,
     pub selected_left: usize,
     pub selected_right: usize,
@@ -96,10 +124,18 @@ pub struct App {
     /// stays pinned at column 0 so context isn't lost.
     pub pick_hscroll: u16,
     pub pick_list_state: ListState,
+    /// Rect of the picker's candidates list, set during the picker draw
+    /// so mouse handlers can hit-test clicks and scroll-wheel events.
+    /// `None` between draws or when no picker is open.
+    pub pick_list_rect: Option<Rect>,
     /// Row offset for the scrollable help overlay. Persists between F1
     /// openings so the user comes back where they left off; reset on
     /// dismiss.
     pub help_scroll: u16,
+    /// Name of the preset currently in effect (set at startup from
+    /// `config.preset`, mutated by the in-app theme picker). Used to
+    /// highlight the active row in the Ctrl-T overlay.
+    pub active_preset: Option<String>,
     /// Transient one-line notice (e.g. "Saved 3 edits"). Cleared after a few
     /// seconds so it doesn't accumulate.
     pub flash: Option<(String, Instant)>,
@@ -110,6 +146,7 @@ pub struct App {
 impl App {
     pub fn new(config: MimeTuiConfig) -> Result<Self> {
         let (apps, mimes, assoc) = load_world()?;
+        let user_baseline = storage::mimeapps::read_user_file_baseline();
         Ok(Self {
             view: View::ByMime,
             focus: Focus::Left,
@@ -120,6 +157,7 @@ impl App {
             apps,
             mimes,
             assoc,
+            user_baseline,
             pending: PendingEdits::default(),
             selected_left: 0,
             selected_right: 0,
@@ -135,7 +173,9 @@ impl App {
             pick_mark: None,
             pick_hscroll: 0,
             pick_list_state: ListState::default(),
+            pick_list_rect: None,
             help_scroll: 0,
+            active_preset: None,
             flash: None,
             config,
             fuzzy_matcher: SkimMatcherV2::default(),
@@ -461,32 +501,99 @@ impl App {
         self.pending.clear();
     }
 
-    /// Atomically save pending edits to the user's `mimeapps.list` and reload
-    /// `OnDiskAssoc`. Returns `(num_edits, shadowed_defaults)` where the
-    /// second vec lists mime ids whose default we just wrote but where a
-    /// higher-priority per-desktop file still owns the entry — so the change
-    /// will be silently overridden until the user edits that file too.
-    pub fn save(&mut self) -> Result<(usize, Vec<String>)> {
-        let n = self.pending.count();
+    /// Conflict-aware save. Returns one of:
+    ///
+    /// * `Ok(SaveResult::Saved { written, shadowed, merged_external })` —
+    ///   wrote successfully. `shadowed` lists mimes whose new default will
+    ///   be silently overridden by a higher-priority per-desktop file.
+    ///   `merged_external` is `true` if non-conflicting external edits
+    ///   landed mid-session and were preserved.
+    /// * `Ok(SaveResult::Conflicts(c))` — external changes overlap with our
+    ///   pending edits; nothing was written. The caller should route to
+    ///   `Mode::ConflictResolve` so the user can choose how to proceed.
+    /// * `Err(_)` — I/O / parse failure.
+    pub fn save(&mut self) -> Result<SaveResult> {
+        let path = storage::mimeapps::user_mimeapps_path()
+            .ok_or_else(|| eyre::eyre!("could not resolve XDG_CONFIG_HOME"))?;
         let pending_defaults: Vec<String> =
             self.pending.set_default.keys().cloned().collect();
 
-        storage::mimeapps::save_user_file(&self.pending)?;
+        match storage::mimeapps::save_user_file_safely_at(
+            &path,
+            &self.pending,
+            &self.user_baseline,
+        ) {
+            Ok(outcome) => {
+                let merged = outcome.merged_external_changes;
+                let written = outcome.written;
+                self.finalise_save();
+                let shadowed = self.compute_shadowed(&pending_defaults);
+                let _ = storage::mimeapps::run_update_desktop_database();
+                Ok(SaveResult::Saved {
+                    written,
+                    shadowed,
+                    merged_external: merged,
+                })
+            }
+            Err(SaveError::Conflicts(conflicts)) => Ok(SaveResult::Conflicts(conflicts)),
+            Err(SaveError::Io(e)) => Err(e),
+        }
+    }
+
+    /// Force-write pending over whatever's on disk — used by the
+    /// ConflictResolve "overwrite" action. Skips conflict detection;
+    /// external edits to overlapping mimes get clobbered.
+    pub fn save_force(&mut self) -> Result<(usize, Vec<String>)> {
+        let path = storage::mimeapps::user_mimeapps_path()
+            .ok_or_else(|| eyre::eyre!("could not resolve XDG_CONFIG_HOME"))?;
+        let written = self.pending.count();
+        let pending_defaults: Vec<String> =
+            self.pending.set_default.keys().cloned().collect();
+        storage::mimeapps::save_user_file_force_at(&path, &self.pending)?;
+        self.finalise_save();
+        let shadowed = self.compute_shadowed(&pending_defaults);
+        let _ = storage::mimeapps::run_update_desktop_database();
+        Ok((written, shadowed))
+    }
+
+    /// Discard the conflicting pending edits and try the save again. Used
+    /// by the ConflictResolve "merge" action.
+    pub fn save_dropping_conflicts(
+        &mut self,
+        conflicts: &[MimeConflict],
+    ) -> Result<SaveResult> {
+        storage::mimeapps::drop_conflicting_edits(&mut self.pending, conflicts);
+        self.save()
+    }
+
+    /// Drop all pending edits and re-read the on-disk state as if the user
+    /// had just opened mime-tui. Used by the ConflictResolve "reload"
+    /// action.
+    pub fn reload_from_disk(&mut self) {
         self.pending.clear();
         self.assoc = storage::mimeapps::read_all();
+        self.user_baseline = storage::mimeapps::read_user_file_baseline();
+    }
 
+    fn finalise_save(&mut self) {
+        self.pending.clear();
+        self.assoc = storage::mimeapps::read_all();
+        self.user_baseline = storage::mimeapps::read_user_file_baseline();
+    }
+
+    fn compute_shadowed(&self, pending_defaults: &[String]) -> Vec<String> {
         let user_path = storage::mimeapps::user_mimeapps_path();
-        let shadowed: Vec<String> = pending_defaults
-            .into_iter()
+        pending_defaults
+            .iter()
             .filter(|mime| {
-                let actual_source = self.assoc.default_sources.get(mime);
+                let actual_source = self.assoc.default_sources.get(*mime);
                 match (actual_source, user_path.as_ref()) {
                     (Some(src), Some(up)) => src != up,
                     _ => false,
                 }
             })
-            .collect();
-        Ok((n, shadowed))
+            .cloned()
+            .collect()
     }
 
     // ───────────── picker ──────────────────────────────────────────────────
@@ -513,6 +620,51 @@ impl App {
         self.mode = Mode::Browse;
         self.pick_mark = None;
         self.pick_hscroll = 0;
+    }
+
+    // ───────────── theme picker (Ctrl-T) ───────────────────────────────────
+
+    /// Open the live theme-preview overlay. Snapshots the current colours
+    /// so Esc can revert if the user is just browsing.
+    pub fn open_theme_pick(&mut self) {
+        let original_colors = self.config.colors.clone();
+        // Start the cursor on something sensible — the user's most recent
+        // active preset if known, otherwise the first entry.
+        let selected = crate::config::PRESET_NAMES
+            .iter()
+            .position(|n| Some(*n) == self.active_preset.as_deref())
+            .unwrap_or(0);
+        self.mode = Mode::ThemePick {
+            original_colors,
+            selected,
+        };
+    }
+
+    /// Apply the preset at the given index for live preview. Updates the
+    /// resolved Theme in `self.config.colors` so the next frame paints with
+    /// it; also writes back the selected index so the overlay knows what to
+    /// highlight.
+    pub fn preview_theme(&mut self, idx: usize) {
+        let name = match crate::config::PRESET_NAMES.get(idx) {
+            Some(n) => *n,
+            None => return,
+        };
+        crate::config::apply_preset(&mut self.config, name);
+        if let Mode::ThemePick { selected, .. } = &mut self.mode {
+            *selected = idx;
+        }
+        self.active_preset = Some(name.to_string());
+    }
+
+    /// Close the theme picker. `cancel = true` reverts to the colours we
+    /// snapshotted on open; `false` keeps the current preview.
+    pub fn close_theme_pick(&mut self, cancel: bool) {
+        if cancel {
+            if let Mode::ThemePick { original_colors, .. } = self.mode.clone() {
+                self.config.colors = original_colors;
+            }
+        }
+        self.mode = Mode::Browse;
     }
 
     /// Set the mark at the current cursor if there isn't one; clear it
@@ -674,6 +826,7 @@ impl App {
             input: Input::default(),
             cursor_visible: true,
             cursor_last_toggle: Instant::now(),
+            user_baseline: UserFileBaseline::default(),
             apps,
             mimes,
             assoc,
@@ -692,7 +845,9 @@ impl App {
             pick_mark: None,
             pick_hscroll: 0,
             pick_list_state: ListState::default(),
+            pick_list_rect: None,
             help_scroll: 0,
+            active_preset: None,
             flash: None,
             config: MimeTuiConfig::default(),
             fuzzy_matcher: SkimMatcherV2::default(),

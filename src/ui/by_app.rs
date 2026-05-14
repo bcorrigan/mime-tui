@@ -10,6 +10,18 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
+/// Pick the per-marker foreground colour for the by-app right pane —
+/// mirrors `picker::marker_style` so the same relation reads identically
+/// in both places.
+fn marker_style(rel: Relation, config: &MimeTuiConfig) -> Style {
+    let colour_field = match rel {
+        Relation::Default => &config.colors.marker_default,
+        Relation::Associated => &config.colors.marker_associated,
+        Relation::DeclaredOnly => &config.colors.marker_declared_only,
+    };
+    Style::default().fg(Theme::parse_color(colour_field))
+}
+
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
     // App names are typically short and the right pane wants room to show
     // the mime list with markers; give the right side more space.
@@ -86,11 +98,13 @@ fn render_summary(
         .map(|a| format!(" {} ", a.name))
         .unwrap_or_else(|| " — ".into());
 
+    let text = layout::theme_text_style(config);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(Theme::parse_border_type(&config.colors.border_style))
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(text);
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(a) = selected {
@@ -102,7 +116,10 @@ fn render_summary(
     }
 
     f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .style(text)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -130,44 +147,59 @@ fn render_mimes_list(
 
     let app_id = a.id.clone();
     let list = app.mime_list_for_app(&app_id);
-    let items: Vec<String> = list
+    let secondary = Style::default().fg(Theme::parse_color(&config.colors.secondary));
+
+    // Build each row as a Line so the relation marker can carry its own
+    // themed colour. Layout per row:
+    //
+    //   span[0] = relation marker (★ / ✓ / · — styled by marker_style)
+    //   span[1] = " "  (1-char separator, raw)
+    //   span[2] = mime id (raw)
+    //   span[3] = " (default)" / " (declared, not associated)" (dim) if any
+    //
+    // pin_count = 2 keeps the marker + its trailing space stuck at the
+    // left edge when horizontally scrolled.
+    let items: Vec<Line<'static>> = list
         .iter()
         .map(|(m, rel)| {
-            let marker = match rel {
-                Relation::Default => "★ ",
-                Relation::Associated => "+ ",
-                Relation::DeclaredOnly => "· ",
+            let rel_char = match rel {
+                Relation::Default => "★",
+                Relation::Associated => "✓",
+                Relation::DeclaredOnly => "·",
             };
             let suffix = match rel {
                 Relation::Default => "  (default)",
                 Relation::Associated => "",
                 Relation::DeclaredOnly => "  (declared, not associated)",
             };
-            format!("{}{}{}", marker, m.id, suffix)
+            let mut spans = vec![
+                Span::styled(rel_char.to_string(), marker_style(*rel, config)),
+                Span::raw(" "),
+                Span::raw(m.id.clone()),
+            ];
+            if !suffix.is_empty() {
+                spans.push(Span::styled(suffix.to_string(), secondary));
+            }
+            Line::from(spans)
         })
         .collect();
 
-    // Some apps declare very long mime ids — let the right pane scroll
-    // horizontally with Shift+←/→ when focused, and show the bar at the
-    // bottom of the box only when there's overflow.
-    let max_content_w: usize = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    // Long mime ids overflow the pane — Shift+←/→ scrolls when focused,
+    // scrollbar appears at the bottom only on overflow.
+    let max_content_w: usize = items.iter().map(|l| l.width()).max().unwrap_or(0);
     let inner_w = (area.width as usize).saturating_sub(4);
     let hscroll = (app.right_hscroll as usize).min(max_content_w.saturating_sub(inner_w));
     app.right_hscroll = hscroll as u16;
 
-    let scrolled: Vec<String> = if hscroll == 0 {
-        items
-    } else {
-        items
-            .iter()
-            .map(|s| s.chars().skip(hscroll).collect::<String>())
-            .collect()
-    };
+    let scrolled: Vec<Line<'static>> = items
+        .iter()
+        .map(|l| layout::scroll_line(l, hscroll, 2))
+        .collect();
 
     let focus_right = app.focus == Focus::Right;
     let clamped = app.selected_right.min(scrolled.len().saturating_sub(1));
     let selected = if focus_right { Some(clamped) } else { None };
-    layout::render_list(
+    layout::render_list_lines(
         f,
         area,
         " MIME types ",
