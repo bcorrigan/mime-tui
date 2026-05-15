@@ -6,6 +6,7 @@ pub mod layout;
 mod by_app;
 mod by_mime;
 mod confirm;
+mod confirm_save;
 mod help;
 mod picker;
 mod save_conflict;
@@ -40,6 +41,7 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
         Mode::ThemePick { selected, .. } => {
             theme_pick::draw(f, app, selected, config)
         }
+        Mode::ConfirmSave => confirm_save::draw(f, app, config),
         Mode::Browse => {}
     }
 }

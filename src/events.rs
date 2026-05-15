@@ -32,6 +32,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         Mode::ThemePick { selected, .. } => {
             Ok(handle_key_theme_pick(app, key, selected))
         }
+        Mode::ConfirmSave => Ok(handle_key_confirm_save(app, key)),
     }
 }
 
@@ -41,7 +42,14 @@ fn handle_key_browse(app: &mut App, key: KeyEvent) -> Result<bool> {
     // Mode-changing globals first.
     match (key.code, key.modifiers) {
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-            do_save(app);
+            // Ctrl-S now routes through a review modal so the user gets
+            // a last-chance summary of pending edits. Clean state still
+            // flashes its no-op message inline.
+            if app.is_dirty() {
+                app.open_confirm_save();
+            } else {
+                app.set_flash("Nothing to save.");
+            }
             return Ok(false);
         }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
@@ -411,6 +419,73 @@ fn action_clear_default(app: &mut App) {
     };
     app.action_clear_default(&mime_id);
     app.set_flash(format!("{} now has no default app", mime_id));
+}
+
+/// Columns to scroll horizontally on Shift+←/→ in the confirm-save modal.
+const CONFIRM_SAVE_HSCROLL_STEP: u16 = 8;
+/// Page size for PgUp/PgDn/Space/b. A modest value works regardless of the
+/// actual modal height — repeated presses page through cleanly.
+const CONFIRM_SAVE_PAGE: u16 = 10;
+
+fn handle_key_confirm_save(app: &mut App, key: KeyEvent) -> bool {
+    match (key.code, key.modifiers) {
+        // Accept — commit the pending edits.
+        (KeyCode::Enter, _)
+        | (KeyCode::Char('y'), _)
+        | (KeyCode::Char('Y'), _) => {
+            app.close_confirm_save();
+            do_save(app);
+        }
+        // Cancel — back to Browse with pending edits intact.
+        (KeyCode::Esc, _)
+        | (KeyCode::Char('n'), _)
+        | (KeyCode::Char('N'), _)
+        | (KeyCode::Char('q'), _)
+        | (KeyCode::Char('Q'), _)
+        | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+        | (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+            app.close_confirm_save();
+        }
+        // Vertical scroll. The renderer clamps `confirm_save_vscroll`
+        // against the actual content height every frame, so we don't need
+        // exact bounds here.
+        (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            app.confirm_save_vscroll = app.confirm_save_vscroll.saturating_sub(1);
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+            app.confirm_save_vscroll = app.confirm_save_vscroll.saturating_add(1);
+        }
+        (KeyCode::PageUp, _) | (KeyCode::Char('b'), KeyModifiers::NONE) => {
+            app.confirm_save_vscroll =
+                app.confirm_save_vscroll.saturating_sub(CONFIRM_SAVE_PAGE);
+        }
+        (KeyCode::PageDown, _) | (KeyCode::Char(' '), KeyModifiers::NONE) => {
+            app.confirm_save_vscroll =
+                app.confirm_save_vscroll.saturating_add(CONFIRM_SAVE_PAGE);
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            app.confirm_save_vscroll = 0;
+        }
+        (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
+            // Renderer will clamp this against the actual content height.
+            app.confirm_save_vscroll = u16::MAX;
+        }
+        // Horizontal scroll for long mime ids that overflow the modal.
+        (KeyCode::Left, KeyModifiers::SHIFT)
+        | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+            app.confirm_save_hscroll = app
+                .confirm_save_hscroll
+                .saturating_sub(CONFIRM_SAVE_HSCROLL_STEP);
+        }
+        (KeyCode::Right, KeyModifiers::SHIFT)
+        | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+            app.confirm_save_hscroll = app
+                .confirm_save_hscroll
+                .saturating_add(CONFIRM_SAVE_HSCROLL_STEP);
+        }
+        _ => {}
+    }
+    false
 }
 
 fn do_save(app: &mut App) {
@@ -812,9 +887,30 @@ pub fn handle_mouse(app: &mut App, ev: MouseEvent) -> Result<bool> {
         Mode::ThemePick { selected, .. } => {
             Ok(handle_mouse_theme_pick(app, ev, selected))
         }
+        Mode::ConfirmSave => Ok(handle_mouse_confirm_save(app, ev)),
         // These modals are small and decision-focused — keyboard-only.
         Mode::ConfirmQuit | Mode::ConflictResolve { .. } => Ok(false),
     }
+}
+
+fn handle_mouse_confirm_save(app: &mut App, ev: MouseEvent) -> bool {
+    // The modal owns most of the screen; route any wheel event to vertical
+    // scroll without bothering with hit-tests, matching the help overlay's
+    // pragmatic stance.
+    match ev.kind {
+        MouseEventKind::ScrollUp => {
+            app.confirm_save_vscroll = app
+                .confirm_save_vscroll
+                .saturating_sub(WHEEL_STEP as u16);
+        }
+        MouseEventKind::ScrollDown => {
+            app.confirm_save_vscroll = app
+                .confirm_save_vscroll
+                .saturating_add(WHEEL_STEP as u16);
+        }
+        _ => {}
+    }
+    false
 }
 
 fn handle_mouse_theme_pick(app: &mut App, ev: MouseEvent, selected: usize) -> bool {

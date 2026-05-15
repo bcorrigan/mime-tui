@@ -115,6 +115,12 @@ fn build_chunks(app: &App, config: &MimeTuiConfig) -> Vec<Chunk> {
             chunks.push(sep_chunk(dim));
             chunks.push(kv_chunk("Esc", ":cancel", key, dim));
         }
+        Mode::ConfirmSave => {
+            chunks.push(kv_chunk("↑↓/PgUp/PgDn", ":scroll", key, dim));
+            chunks.push(sep_chunk(dim));
+            chunks.push(kv_chunk("Enter/y", ":save", key, dim));
+            chunks.push(kv_chunk("Esc/n", ":cancel", key, dim));
+        }
     }
 
     chunks

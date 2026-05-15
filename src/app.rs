@@ -49,6 +49,33 @@ pub enum Mode {
         original_colors: Theme,
         selected: usize,
     },
+    /// Pre-save review modal. Lists every pending edit grouped by mime;
+    /// Enter / y commits via `do_save`, Esc / n / q returns to Browse with
+    /// edits intact.
+    ConfirmSave,
+}
+
+/// How a single mime's default is changing. Used by the confirm-save modal
+/// to render a one-line summary per default change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultChange {
+    /// Default is being set to `new`. `old` is the on-disk default if any.
+    Set { new: String, old: Option<String> },
+    /// Default is being cleared. `old` is the on-disk default if any (None
+    /// in the rare case the user clears an already-unset default).
+    Cleared { old: Option<String> },
+}
+
+/// All pending edits affecting one mime, in a shape the confirm-save UI
+/// can iterate over directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSummary {
+    pub mime: String,
+    pub default_change: Option<DefaultChange>,
+    /// Sorted app ids being added to this mime's associations.
+    pub adds: Vec<String>,
+    /// Sorted app ids being removed.
+    pub removes: Vec<String>,
 }
 
 /// Result of `App::save`. The wrapping `Result<_, eyre::Report>` only
@@ -132,6 +159,12 @@ pub struct App {
     /// openings so the user comes back where they left off; reset on
     /// dismiss.
     pub help_scroll: u16,
+    /// Vertical scroll offset for the confirm-save modal. Reset to 0 each
+    /// time the modal opens so the user starts at the top.
+    pub confirm_save_vscroll: u16,
+    /// Horizontal scroll offset for the confirm-save modal. Long mime ids
+    /// can overflow the modal width; Shift+←/→ moves this.
+    pub confirm_save_hscroll: u16,
     /// Name of the preset currently in effect (set at startup from
     /// `config.preset`, mutated by the in-app theme picker). Used to
     /// highlight the active row in the Ctrl-T overlay.
@@ -180,6 +213,8 @@ impl App {
             pick_list_state: ListState::default(),
             pick_list_rect: None,
             help_scroll: 0,
+            confirm_save_vscroll: 0,
+            confirm_save_hscroll: 0,
             active_preset: None,
             flash: None,
             pending_suspend: false,
@@ -880,6 +915,80 @@ impl App {
 
     /// Close the theme picker. `cancel = true` reverts to the colours we
     /// snapshotted on open; `false` keeps the current preview.
+    /// Enter the confirm-save review modal. Scroll resets each time so the
+    /// user lands at the top of the change list.
+    pub fn open_confirm_save(&mut self) {
+        self.confirm_save_vscroll = 0;
+        self.confirm_save_hscroll = 0;
+        self.mode = Mode::ConfirmSave;
+    }
+
+    /// Leave the confirm-save modal back to Browse without saving.
+    pub fn close_confirm_save(&mut self) {
+        self.mode = Mode::Browse;
+    }
+
+    /// Build a per-mime summary of every pending edit, suitable for direct
+    /// rendering by the confirm-save modal. Mimes are returned sorted; adds
+    /// and removes within each are also sorted (alphabetic on app id). The
+    /// goal is a stable, glanceable view of the diff the user is about to
+    /// commit.
+    pub fn pending_change_summary(&self) -> Vec<ChangeSummary> {
+        use std::collections::BTreeSet;
+
+        let mut mimes: BTreeSet<String> = BTreeSet::new();
+        mimes.extend(self.pending.set_default.keys().cloned());
+        mimes.extend(self.pending.add.keys().cloned());
+        mimes.extend(self.pending.remove.keys().cloned());
+
+        let mut out = Vec::with_capacity(mimes.len());
+        for mime in mimes {
+            let default_change = self.pending.set_default.get(&mime).map(|slot| {
+                let old = self.assoc.defaults.get(&mime).cloned();
+                match slot {
+                    Some(new) => DefaultChange::Set {
+                        new: new.clone(),
+                        old,
+                    },
+                    None => DefaultChange::Cleared { old },
+                }
+            });
+            let mut adds: Vec<String> = self
+                .pending
+                .add
+                .get(&mime)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+            adds.sort();
+            let mut removes: Vec<String> = self
+                .pending
+                .remove
+                .get(&mime)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+            removes.sort();
+
+            out.push(ChangeSummary {
+                mime,
+                default_change,
+                adds,
+                removes,
+            });
+        }
+        out
+    }
+
+    /// Display name for an app id, falling back to the id itself when the
+    /// app isn't in our index (e.g. the .desktop has been uninstalled
+    /// between when the edit was queued and when we render).
+    pub fn app_name_for(&self, app_id: &str) -> String {
+        self.apps
+            .iter()
+            .find(|a| a.id == app_id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| app_id.to_string())
+    }
+
     pub fn close_theme_pick(&mut self, cancel: bool) {
         if cancel {
             if let Mode::ThemePick { original_colors, .. } = self.mode.clone() {
@@ -1069,6 +1178,8 @@ impl App {
             pick_list_state: ListState::default(),
             pick_list_rect: None,
             help_scroll: 0,
+            confirm_save_vscroll: 0,
+            confirm_save_hscroll: 0,
             active_preset: None,
             flash: None,
             pending_suspend: false,
@@ -1414,6 +1525,105 @@ mod tests {
         app.action_remove_assoc("text/html", "chromium.desktop");
         assert!(app.is_pending_removed_row("text/html", "chromium.desktop"));
         assert_eq!(app.pending.count(), 1);
+    }
+
+    #[test]
+    fn pending_change_summary_is_empty_when_clean() {
+        let (apps, mimes, assoc) = sample_world();
+        let app = App::for_test(apps, mimes, assoc);
+        assert!(app.pending_change_summary().is_empty());
+    }
+
+    #[test]
+    fn pending_change_summary_groups_per_mime_and_sorts() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        assoc
+            .added
+            .entry("text/html".into())
+            .or_default()
+            .insert("chromium.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        // Mixed edits across two mimes — verify grouping, sort order, and
+        // that DefaultChange::Set carries the on-disk previous value.
+        app.action_set_default("text/html", "chromium.desktop");
+        app.action_remove_assoc("text/html", "firefox.desktop");
+        app.apps[0].mime_types.clear();
+        app.apps[1].mime_types.clear();
+        app.action_add_assoc("application/pdf", "chromium.desktop");
+
+        let summary = app.pending_change_summary();
+        assert_eq!(summary.len(), 2);
+        // Sorted by mime id: application/pdf before text/html.
+        assert_eq!(summary[0].mime, "application/pdf");
+        assert_eq!(summary[1].mime, "text/html");
+
+        // application/pdf: just an add.
+        assert_eq!(summary[0].default_change, None);
+        assert_eq!(summary[0].adds, vec!["chromium.desktop"]);
+        assert!(summary[0].removes.is_empty());
+
+        // text/html: default change AND a remove. The default change must
+        // carry the on-disk previous default in `old`.
+        match &summary[1].default_change {
+            Some(DefaultChange::Set { new, old }) => {
+                assert_eq!(new, "chromium.desktop");
+                assert_eq!(old.as_deref(), Some("firefox.desktop"));
+            }
+            other => panic!("expected Set default change, got {:?}", other),
+        }
+        assert_eq!(summary[1].removes, vec!["firefox.desktop"]);
+    }
+
+    #[test]
+    fn pending_change_summary_captures_default_cleared() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+        app.action_clear_default("text/html");
+
+        let summary = app.pending_change_summary();
+        assert_eq!(summary.len(), 1);
+        match &summary[0].default_change {
+            Some(DefaultChange::Cleared { old }) => {
+                assert_eq!(old.as_deref(), Some("firefox.desktop"));
+            }
+            other => panic!("expected Cleared default change, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pending_change_summary_sorts_adds_and_removes_within_mime() {
+        let (apps, mimes, mut assoc) = sample_world();
+        // Ensure both apps have an on-disk anchor so action_remove_assoc
+        // writes pending.remove rather than cancelling an add.
+        assoc
+            .added
+            .entry("text/html".into())
+            .or_default()
+            .insert("chromium.desktop".into());
+        assoc
+            .added
+            .entry("text/html".into())
+            .or_default()
+            .insert("firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        // Remove in non-alphabetical order — summary must sort them.
+        app.action_remove_assoc("text/html", "firefox.desktop");
+        app.action_remove_assoc("text/html", "chromium.desktop");
+
+        let summary = app.pending_change_summary();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(
+            summary[0].removes,
+            vec!["chromium.desktop", "firefox.desktop"]
+        );
     }
 
     #[test]
