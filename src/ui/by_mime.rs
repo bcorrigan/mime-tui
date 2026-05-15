@@ -57,14 +57,35 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
             .collect()
     };
 
-    let clamped_left = app.selected_left.min(scrolled.len().saturating_sub(1));
+    // Style each row: a mime whose default / added / pending assocs reach
+    // a non-installed `.desktop` gets the `invalid` colour + bold, so the
+    // user can scan the list and immediately see which mimes have stale
+    // entries to clean up.
+    let invalid_style = Style::default()
+        .fg(Theme::parse_color(&config.colors.invalid))
+        .add_modifier(Modifier::BOLD);
+    let items: Vec<Line<'static>> = scrolled
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mime = &visible[i];
+            let style = if app.mime_has_missing(&mime.id) {
+                invalid_style
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(s.clone(), style))
+        })
+        .collect();
+
+    let clamped_left = app.selected_left.min(items.len().saturating_sub(1));
     let focus_left = app.focus == Focus::Left;
 
-    layout::render_list(
+    layout::render_list_lines(
         f,
         left_area,
         " MIME types ",
-        &scrolled,
+        &items,
         Some(clamped_left),
         focus_left,
         config,
@@ -151,7 +172,22 @@ fn render_summary(
                     )));
                 }
             }
-            None => lines.push(Line::from(Span::styled("  (none set)", dim))),
+            None => match app.missing_default_for(&m.id) {
+                Some(missing_id) => {
+                    let invalid = Style::default()
+                        .fg(Theme::parse_color(&config.colors.invalid))
+                        .add_modifier(Modifier::BOLD);
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", missing_id),
+                        invalid,
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  (app not installed)".to_string(),
+                        invalid,
+                    )));
+                }
+                None => lines.push(Line::from(Span::styled("  (none set)", dim))),
+            },
         }
     }
 
@@ -208,7 +244,7 @@ fn render_associations(
     // Each row: [pending-sigil][space][name][optional "  (default)" suffix].
     // pin_count = 2 so the sigil + its trailing space stay anchored at the
     // left edge when the row is horizontally scrolled.
-    let items: Vec<Line<'static>> = assoc
+    let mut items: Vec<Line<'static>> = assoc
         .iter()
         .map(|(e, is_removed)| {
             let is_pending = app.is_pending_row(&mime_id, &e.id);
@@ -240,6 +276,35 @@ fn render_associations(
             Line::from(spans)
         })
         .collect();
+
+    // Append phantom rows — entries on disk / pending that point at a
+    // `.desktop` we don't see in the installed apps index. Rendered bold
+    // in the `invalid` colour and tagged "(app not installed)" so the
+    // user can spot — and `r` to clean up — stale mimeapps.list entries
+    // left behind by uninstalled apps.
+    let invalid_style = Style::default()
+        .fg(Theme::parse_color(&config.colors.invalid))
+        .add_modifier(Modifier::BOLD);
+    let invalid_struck = invalid_style.add_modifier(Modifier::CROSSED_OUT);
+    for missing in app.missing_associations_for(&mime_id) {
+        let row_style = if missing.is_pending_removed {
+            invalid_struck
+        } else {
+            invalid_style
+        };
+        let is_pending = app.is_pending_row(&mime_id, &missing.app_id);
+        let sigil = if is_pending { "*" } else { " " };
+        let mut spans = vec![
+            Span::styled(sigil.to_string(), pending_style),
+            Span::raw(" "),
+            Span::styled(missing.app_id.clone(), row_style),
+        ];
+        if missing.is_default {
+            spans.push(Span::styled("  (default)".to_string(), row_style));
+        }
+        spans.push(Span::styled("  (app not installed)".to_string(), row_style));
+        items.push(Line::from(spans));
+    }
 
     // Associations are usually app names (short), but a verbose
     // "(default)" suffix can still overflow on narrow panes.

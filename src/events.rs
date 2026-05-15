@@ -314,6 +314,9 @@ fn right_pane_count(app: &App) -> usize {
     // must match — otherwise `selected_right` drifts relative to the rows
     // the user actually sees, which is how repeated `r` ended up removing
     // unrelated items further down the list.
+    //
+    // In by-mime we also append "missing" rows (phantom associations
+    // pointing at uninstalled apps), so they're counted here too.
     match app.view {
         View::ByMime => {
             let Some(m) = app.currently_selected_mime() else {
@@ -321,6 +324,7 @@ fn right_pane_count(app: &App) -> usize {
             };
             let mime_id = m.id.clone();
             app.displayable_associations_for(&mime_id).len()
+                + app.missing_associations_for(&mime_id).len()
         }
         View::ByApp => {
             let Some(a) = app.currently_selected_app() else {
@@ -349,13 +353,22 @@ fn target_pair(app: &App) -> Option<(String, String, String)> {
     // Index into the *displayable* lists so the (mime, app) we resolve
     // matches the row the user has highlighted — including pending-removed
     // rows that the UI keeps visible with strikethrough.
+    //
+    // In by-mime, missing rows (uninstalled apps) are appended after the
+    // installed/pending-removed rows; when the cursor sits on one of
+    // those, the resolved name falls back to the app id since we don't
+    // have a real .desktop name to show in flash messages.
     match app.view {
         View::ByMime => {
             let mime = app.currently_selected_mime()?;
             let mime_id = mime.id.clone();
             let assoc = app.displayable_associations_for(&mime_id);
-            let (entry, _is_removed) = assoc.get(app.selected_right)?;
-            Some((mime_id, entry.id.clone(), entry.name.clone()))
+            if let Some((entry, _is_removed)) = assoc.get(app.selected_right) {
+                return Some((mime_id, entry.id.clone(), entry.name.clone()));
+            }
+            let missing = app.missing_associations_for(&mime_id);
+            let m = missing.get(app.selected_right - assoc.len())?;
+            Some((mime_id, m.app_id.clone(), m.app_id.clone()))
         }
         View::ByApp => {
             let a = app.currently_selected_app()?;
@@ -394,11 +407,16 @@ fn action_remove(app: &mut App) {
             app_name, mime_id
         ));
     } else {
-        app.action_remove_assoc(&mime_id, &app_id);
-        app.set_flash(format!(
-            "{} is no longer associated with {}",
-            app_name, mime_id
-        ));
+        let cleared_default = app.action_remove_assoc(&mime_id, &app_id);
+        let msg = if cleared_default {
+            format!(
+                "{} removed from {} (also cleared as default)",
+                app_name, mime_id
+            )
+        } else {
+            format!("{} is no longer associated with {}", app_name, mime_id)
+        };
+        app.set_flash(msg);
     }
 
     // Keep right-pane selection in bounds. The displayable count is stable

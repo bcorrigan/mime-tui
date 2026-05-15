@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
 use eyre::Result;
@@ -64,6 +64,19 @@ pub enum DefaultChange {
     /// Default is being cleared. `old` is the on-disk default if any (None
     /// in the rare case the user clears an already-unset default).
     Cleared { old: Option<String> },
+}
+
+/// A mime association pointing at a `.desktop` that isn't installed.
+/// Surfaced in the by-mime right pane so the user can see — and clean
+/// up — stale entries left behind by uninstalled apps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingAssoc {
+    pub app_id: String,
+    /// True when this is (or would be) the default app for the mime,
+    /// driving the ★ marker on the row.
+    pub is_default: bool,
+    /// True when the user has already marked this id for removal.
+    pub is_pending_removed: bool,
 }
 
 /// All pending edits affecting one mime, in a shape the confirm-save UI
@@ -436,36 +449,62 @@ impl App {
         self.pending.set_default(mime, None);
     }
 
-    /// Remove `app_id` from the associations of `mime`. If it was the default,
-    /// clear the default too.
+    /// Remove `app_id` from the associations of `mime`. If it was the
+    /// default, also clear the default — leaving `[Default Applications]
+    /// X=mime` while `[Removed Associations] X=mime` is set is a
+    /// "valid-file, useless-state" combination that no spec-compliant
+    /// resolver would honour anyway.
+    ///
+    /// Returns `true` when the call also cleared a (would-be) default —
+    /// callers use this to surface an explanatory flash.
     ///
     /// Special-cases the "added then removed, all in this session" pattern:
     /// if the row only exists because of a pending add (no on-disk anchor),
-    /// we just cancel the pending add. Writing a `pending.remove` entry for
-    /// a row that doesn't exist on disk would leave a misleading "going
-    /// away" indicator for something that was never going to be saved.
-    pub fn action_remove_assoc(&mut self, mime: &str, app_id: &str) {
+    /// we cancel the pending add instead of writing a remove entry.
+    pub fn action_remove_assoc(&mut self, mime: &str, app_id: &str) -> bool {
         if !self.is_on_disk(mime, app_id) {
             // Pure pending-add row. Drop the add and any pending default
-            // that pointed at it — otherwise we'd leave a default pointing
-            // at an app that's no longer associated.
+            // that pointed at it.
             self.pending.cancel_add(mime, app_id);
             if let Some(Some(id)) = self.pending.set_default.get(mime) {
                 if id == app_id {
                     self.pending.set_default.remove(mime);
+                    return true;
                 }
             }
-            return;
+            return false;
         }
 
+        // Snapshot the would-be default BEFORE mutating pending.remove,
+        // otherwise the row we're about to suppress would mask itself out
+        // of `effective_default_for` and this check never fires (the
+        // historical bug that left orphan defaults behind).
+        let was_default = self.would_be_default_id(mime).as_deref() == Some(app_id);
         self.pending.remove_assoc(mime, app_id);
-        if self
-            .effective_default_for(mime)
-            .map(|d| d.id == app_id)
-            .unwrap_or(false)
-        {
+        if !was_default {
+            return false;
+        }
+
+        // Cascade: drop any pending default change targeting this app,
+        // and if the on-disk default also pointed here, explicitly clear
+        // it so the save doesn't preserve the dangling line.
+        let pending_default_was_app = matches!(
+            self.pending.set_default.get(mime),
+            Some(Some(id)) if id == app_id
+        );
+        if pending_default_was_app {
+            self.pending.set_default.remove(mime);
+        }
+        let on_disk_default_was_app = self
+            .assoc
+            .defaults
+            .get(mime)
+            .map(|s| s == app_id)
+            .unwrap_or(false);
+        if on_disk_default_was_app && !self.pending.set_default.contains_key(mime) {
             self.pending.set_default(mime, None);
         }
+        true
     }
 
     /// True if `app_id` has *any* on-disk presence for `mime` — declared in
@@ -703,6 +742,113 @@ impl App {
                 Some((app, removed))
             })
             .collect()
+    }
+
+    /// Apps referenced by this mime's on-disk or pending state but not
+    /// present in the installed apps index — i.e. phantom entries left
+    /// behind by uninstalled `.desktop` files. The by-mime right pane
+    /// renders these in the `invalid` theme colour so the user can see
+    /// what to clean up.
+    pub fn missing_associations_for(&self, mime: &str) -> Vec<MissingAssoc> {
+        let mut ids: BTreeSet<String> = BTreeSet::new();
+        if let Some(id) = self.assoc.defaults.get(mime) {
+            ids.insert(id.clone());
+        }
+        if let Some(added) = self.assoc.added.get(mime) {
+            for id in added {
+                ids.insert(id.clone());
+            }
+        }
+        if let Some(added) = self.pending.add.get(mime) {
+            for id in added {
+                ids.insert(id.clone());
+            }
+        }
+        if let Some(Some(id)) = self.pending.set_default.get(mime) {
+            ids.insert(id.clone());
+        }
+        if let Some(removed) = self.pending.remove.get(mime) {
+            for id in removed {
+                ids.insert(id.clone());
+            }
+        }
+
+        let default_id = self.would_be_default_id(mime);
+        ids.into_iter()
+            .filter(|id| !self.apps.iter().any(|a| &a.id == id))
+            .map(|id| {
+                let is_default = default_id.as_deref() == Some(&id);
+                let is_pending_removed = self.is_pending_removed_row(mime, &id);
+                MissingAssoc {
+                    app_id: id,
+                    is_default,
+                    is_pending_removed,
+                }
+            })
+            .collect()
+    }
+
+    /// The app id that *would* be the default for `mime` if we ignored
+    /// whether the app is installed. Pending overrides win, then on-disk;
+    /// `[Removed Associations]` and an explicit pending "clear default"
+    /// both yield `None`.
+    fn would_be_default_id(&self, mime: &str) -> Option<String> {
+        if let Some(slot) = self.pending.set_default.get(mime) {
+            return slot.clone();
+        }
+        let on_disk = self.assoc.defaults.get(mime)?;
+        if self.assoc.is_removed(mime, on_disk) {
+            return None;
+        }
+        Some(on_disk.clone())
+    }
+
+    /// Short-circuiting predicate: does this mime have *any* missing
+    /// association (default, added, or pending edit pointing at a
+    /// `.desktop` that isn't installed)? Drives the red row tint in the
+    /// by-mime left pane.
+    pub fn mime_has_missing(&self, mime: &str) -> bool {
+        let installed = |id: &str| self.apps.iter().any(|a| a.id == id);
+        let is_phantom = |id: &str| !installed(id);
+
+        if let Some(id) = self.assoc.defaults.get(mime) {
+            if is_phantom(id) {
+                return true;
+            }
+        }
+        if let Some(added) = self.assoc.added.get(mime) {
+            if added.iter().any(|id| is_phantom(id)) {
+                return true;
+            }
+        }
+        if let Some(added) = self.pending.add.get(mime) {
+            if added.iter().any(|id| is_phantom(id)) {
+                return true;
+            }
+        }
+        if let Some(Some(id)) = self.pending.set_default.get(mime) {
+            if is_phantom(id) {
+                return true;
+            }
+        }
+        if let Some(removed) = self.pending.remove.get(mime) {
+            if removed.iter().any(|id| is_phantom(id)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// If the (would-be) default for `mime` is a non-installed app,
+    /// return its id. Used by the by-mime detail pane to render
+    /// `X.desktop (not installed)` in invalid styling rather than
+    /// silently showing "(none set)".
+    pub fn missing_default_for(&self, mime: &str) -> Option<String> {
+        let id = self.would_be_default_id(mime)?;
+        if self.apps.iter().any(|a| a.id == id) {
+            return None;
+        }
+        Some(id)
     }
 
     /// Like `mime_list_for_app`, but also includes mimes the user has
@@ -1409,30 +1555,79 @@ mod tests {
     }
 
     #[test]
-    fn displayable_mime_list_preserves_default_marker_on_remove() {
+    fn removing_the_default_cascades_to_clear_it() {
+        // firefox is the on-disk default for text/html. Removing it
+        // should also clear the default so we don't leave a dangling
+        // `[Default Applications]` entry pointing at a row that's
+        // simultaneously in `[Removed Associations]`.
         let (apps, mimes, mut assoc) = sample_world();
-        // firefox is the default for text/html.
         assoc
             .defaults
             .insert("text/html".into(), "firefox.desktop".into());
         let mut app = App::for_test(apps, mimes, assoc);
 
-        // User presses `r` on the default app. The marker should stay ★
-        // in the displayable view so the user sees they're removing the
-        // current default.
-        app.action_remove_assoc("text/html", "firefox.desktop");
+        let cleared = app.action_remove_assoc("text/html", "firefox.desktop");
+        assert!(cleared, "should signal that the default was also cleared");
 
+        // pending.set_default reflects the cascade: Some(None) means
+        // "explicitly clear the default on save".
+        let slot = app
+            .pending
+            .set_default
+            .get("text/html")
+            .expect("default change should be staged");
+        assert!(slot.is_none(), "expected Some(None), got {:?}", slot);
+
+        // The displayable view drops the ★ on the strikethrough row —
+        // it's no longer the default after this remove takes effect.
         let displayable = app.displayable_mime_list_for_app("firefox.desktop");
         let row = displayable
             .iter()
             .find(|(m, _, _)| m.id == "text/html")
             .expect("firefox should still appear in displayable list");
         assert!(row.2, "pending-removed flag should be true");
-        assert_eq!(
-            row.1,
-            Relation::Default,
-            "would-be relation should preserve the ★ marker"
+        assert_eq!(row.1, Relation::Associated);
+    }
+
+    #[test]
+    fn removing_non_default_does_not_clear_default() {
+        // chromium is associated but not the default — removing it
+        // mustn't touch the default for the mime.
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        let cleared = app.action_remove_assoc("text/html", "chromium.desktop");
+        assert!(!cleared);
+        assert!(
+            !app.pending.set_default.contains_key("text/html"),
+            "default state must be untouched when removing a non-default row"
         );
+    }
+
+    #[test]
+    fn removing_phantom_default_cascades_clear_too() {
+        // Loupe is the on-disk default for image/jxl but isn't installed
+        // — the phantom-default case the user surfaced. Removing it
+        // should clear the default so saving doesn't leave an orphan
+        // `[Default Applications]` line behind.
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/jxl".into(), "org.gnome.Loupe.desktop".into());
+        let mut mimes = mimes;
+        mimes.push(MimeType {
+            id: "image/jxl".into(),
+            description: "JPEG XL image".into(),
+        });
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        let cleared = app.action_remove_assoc("image/jxl", "org.gnome.Loupe.desktop");
+        assert!(cleared);
+        let slot = app.pending.set_default.get("image/jxl").unwrap();
+        assert!(slot.is_none(), "phantom default should be cleared too");
     }
 
     #[test]
@@ -1525,6 +1720,154 @@ mod tests {
         app.action_remove_assoc("text/html", "chromium.desktop");
         assert!(app.is_pending_removed_row("text/html", "chromium.desktop"));
         assert_eq!(app.pending.count(), 1);
+    }
+
+    #[test]
+    fn mime_has_missing_is_false_when_all_assocs_are_installed() {
+        let (apps, mimes, mut assoc) = sample_world();
+        // firefox is the default for text/html and it's installed.
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        assoc
+            .added
+            .entry("text/html".into())
+            .or_default()
+            .insert("chromium.desktop".into());
+        let app = App::for_test(apps, mimes, assoc);
+        assert!(!app.mime_has_missing("text/html"));
+    }
+
+    #[test]
+    fn mime_has_missing_is_true_when_default_app_is_phantom() {
+        // The Loupe case: default points at a non-installed .desktop.
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "org.gnome.Loupe.desktop".into());
+        let mut mimes = mimes;
+        mimes.push(MimeType {
+            id: "image/png".into(),
+            description: "PNG image".into(),
+        });
+        let app = App::for_test(apps, mimes, assoc);
+        assert!(app.mime_has_missing("image/png"));
+    }
+
+    #[test]
+    fn mime_has_missing_is_true_when_added_app_is_phantom() {
+        // Default is fine, but [Added Associations] points at a phantom.
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "firefox.desktop".into());
+        assoc
+            .added
+            .entry("image/png".into())
+            .or_default()
+            .insert("org.gnome.Loupe.desktop".into());
+        let mut mimes = mimes;
+        mimes.push(MimeType {
+            id: "image/png".into(),
+            description: "PNG image".into(),
+        });
+        let app = App::for_test(apps, mimes, assoc);
+        assert!(app.mime_has_missing("image/png"));
+    }
+
+    #[test]
+    fn missing_associations_surface_uninstalled_default_and_added() {
+        // image/png has firefox as default (installed) AND a phantom
+        // org.gnome.Loupe.desktop in added (not in the installed apps
+        // index). image/jxl has only the phantom Loupe as the default.
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "firefox.desktop".into());
+        assoc
+            .added
+            .entry("image/png".into())
+            .or_default()
+            .insert("org.gnome.Loupe.desktop".into());
+        assoc
+            .defaults
+            .insert("image/jxl".into(), "org.gnome.Loupe.desktop".into());
+
+        // Ensure the test world has the mimes too.
+        let mut mimes = mimes;
+        mimes.push(MimeType {
+            id: "image/png".into(),
+            description: "PNG image".into(),
+        });
+        mimes.push(MimeType {
+            id: "image/jxl".into(),
+            description: "JPEG XL image".into(),
+        });
+
+        let app = App::for_test(apps, mimes, assoc);
+
+        // image/png: firefox is installed → not missing. Loupe is the
+        // phantom → surfaces as missing, not the default for this mime.
+        let png_missing = app.missing_associations_for("image/png");
+        assert_eq!(png_missing.len(), 1);
+        assert_eq!(png_missing[0].app_id, "org.gnome.Loupe.desktop");
+        assert!(!png_missing[0].is_default);
+        assert!(!png_missing[0].is_pending_removed);
+        // Default for image/png resolves cleanly (firefox is installed).
+        assert!(app.missing_default_for("image/png").is_none());
+
+        // image/jxl: Loupe is the would-be default, but it's missing.
+        let jxl_missing = app.missing_associations_for("image/jxl");
+        assert_eq!(jxl_missing.len(), 1);
+        assert_eq!(jxl_missing[0].app_id, "org.gnome.Loupe.desktop");
+        assert!(jxl_missing[0].is_default);
+        assert_eq!(
+            app.missing_default_for("image/jxl").as_deref(),
+            Some("org.gnome.Loupe.desktop"),
+        );
+    }
+
+    #[test]
+    fn missing_associations_reflect_pending_remove_of_phantom() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .added
+            .entry("image/png".into())
+            .or_default()
+            .insert("org.gnome.Loupe.desktop".into());
+        let mut mimes = mimes;
+        mimes.push(MimeType {
+            id: "image/png".into(),
+            description: "PNG image".into(),
+        });
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        // User stages a cleanup of the phantom.
+        app.action_remove_assoc("image/png", "org.gnome.Loupe.desktop");
+
+        let missing = app.missing_associations_for("image/png");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].app_id, "org.gnome.Loupe.desktop");
+        assert!(missing[0].is_pending_removed);
+    }
+
+    #[test]
+    fn missing_default_returns_none_when_pending_clears_it() {
+        // Default on disk is the phantom, but user has staged a clear.
+        // missing_default_for should return None (nothing to flag).
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "org.gnome.Loupe.desktop".into());
+        let mut mimes = mimes;
+        mimes.push(MimeType {
+            id: "image/png".into(),
+            description: "PNG image".into(),
+        });
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        app.action_clear_default("image/png");
+        assert!(app.missing_default_for("image/png").is_none());
     }
 
     #[test]

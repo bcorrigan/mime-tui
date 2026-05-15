@@ -52,6 +52,10 @@ pub struct Theme {
     pub marker_default: String,
     pub marker_associated: String,
     pub marker_declared_only: String,
+    /// Foreground for "invalid" rows — mime associations pointing at a
+    /// `.desktop` that isn't installed. Rendered bold so the user notices
+    /// stale entries to clean up.
+    pub invalid: String,
     pub border_style: String,
     pub highlight_type: String,
     /// Empty → follows `focus`.
@@ -109,6 +113,7 @@ struct RawTheme {
     marker_default: Option<String>,
     marker_associated: Option<String>,
     marker_declared_only: Option<String>,
+    invalid: Option<String>,
     border_style: Option<String>,
     highlight_type: Option<String>,
     cursor_color: Option<String>,
@@ -148,6 +153,7 @@ struct Palette {
     marker_default: &'static str,
     marker_associated: &'static str,
     marker_declared_only: &'static str,
+    invalid: &'static str,
     border_style: &'static str,
     highlight_type: &'static str,
     cursor_color: &'static str,
@@ -170,6 +176,7 @@ const DEFAULT_DARK: Palette = Palette {
     marker_default: "",
     marker_associated: "",
     marker_declared_only: "",
+    invalid: "#ff5252",          // bright red — phantom mime assocs
     border_style: "rounded",
     highlight_type: "background",
     cursor_color: "",
@@ -192,6 +199,7 @@ const DEFAULT_LIGHT: Palette = Palette {
     marker_default: "#f57c00",   // darker amber so ★ pops on white bg
     marker_associated: "#388e3c",
     marker_declared_only: "#888888",
+    invalid: "#c62828",          // dark red — contrastful on white
     border_style: "rounded",
     highlight_type: "background",
     cursor_color: "",
@@ -215,6 +223,7 @@ const GRUVBOX_DARK: Palette = Palette {
     marker_default: "#fe8019",   // bright orange (gruvbox signature)
     marker_associated: "#b8bb26",
     marker_declared_only: "#928374",
+    invalid: "#fb4934",          // gruvbox bright red
     border_style: "rounded",
     highlight_type: "background",
     cursor_color: "",
@@ -242,6 +251,7 @@ const SOLARIZED_LIGHT: Palette = Palette {
     marker_default: "#cb4b16",   // orange
     marker_associated: "#859900",
     marker_declared_only: "#93a1a1",
+    invalid: "#dc322f",          // solarized red
     border_style: "rounded",
     highlight_type: "background",
     cursor_color: "",
@@ -265,6 +275,7 @@ const DRACULA: Palette = Palette {
     marker_default: "#ffb86c",   // orange (★ pops)
     marker_associated: "#50fa7b",
     marker_declared_only: "#6272a4",
+    invalid: "#ff5555",          // dracula red
     border_style: "rounded",
     highlight_type: "background",
     cursor_color: "",
@@ -287,6 +298,7 @@ const NORD: Palette = Palette {
     marker_default: "#d08770",   // aurora orange
     marker_associated: "#a3be8c",
     marker_declared_only: "#4c566a",
+    invalid: "#bf616a",          // nord aurora red
     border_style: "rounded",
     highlight_type: "background",
     cursor_color: "",
@@ -309,6 +321,7 @@ const MONOKAI: Palette = Palette {
     marker_default: "#f92672",   // pink (monokai signature)
     marker_associated: "#a6e22e",
     marker_declared_only: "#75715e",
+    invalid: "#ff6188",          // bright pink-red (distinct from default pink)
     border_style: "rounded",
     highlight_type: "background",
     cursor_color: "",
@@ -373,6 +386,7 @@ fn palette_to_theme(p: &Palette) -> Theme {
         marker_default: p.marker_default.into(),
         marker_associated: p.marker_associated.into(),
         marker_declared_only: p.marker_declared_only.into(),
+        invalid: p.invalid.into(),
         border_style: p.border_style.into(),
         highlight_type: p.highlight_type.into(),
         cursor_color: p.cursor_color.into(),
@@ -404,6 +418,7 @@ fn resolve_config(raw: RawConfig) -> MimeTuiConfig {
             raw.colors.marker_declared_only,
             palette.marker_declared_only,
         ),
+        invalid: merge_str(raw.colors.invalid, palette.invalid),
         border_style: merge_str(raw.colors.border_style, palette.border_style),
         highlight_type: merge_str(raw.colors.highlight_type, palette.highlight_type),
         cursor_color: merge_str(raw.colors.cursor_color, palette.cursor_color),
@@ -525,6 +540,12 @@ fn resolve_fallback_colors(cfg: &mut MimeTuiConfig) {
     }
     if cfg.colors.marker_declared_only.trim().is_empty() {
         cfg.colors.marker_declared_only = cfg.colors.secondary.clone();
+    }
+    if cfg.colors.invalid.trim().is_empty() {
+        // Sensible terminal-aware fallback when the preset doesn't set
+        // one — `red` resolves through `parse_color` to the terminal's
+        // ANSI red, which is the right "broken state" cue everywhere.
+        cfg.colors.invalid = "red".into();
     }
 }
 
