@@ -15,6 +15,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 tui-input = { version = "0.15.3", default-features = false, features = ["crossterm"] }
 ratatui = "0.30.0"
 toml = "1.1"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = "0.39"
 quick-xml = "0.39"
 libc = "0.2"

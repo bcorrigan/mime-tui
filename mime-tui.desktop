@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=mime-tui
+GenericName=MIME Associations Manager
+Comment=Manage MIME-type to application associations
+Exec=mime-tui
+Terminal=true
+# Icon-theme name (not a file). Most modern themes (Adwaita, Papirus,
+# Breeze, etc.) ship this glyph — used for the "Default Applications"
+# settings panel in GNOME/KDE. Swap for any other freedesktop icon name
+# if your theme lacks it; the launcher silently omits the icon if the
+# name doesn't resolve.
+Icon=preferences-desktop-default-applications
+Categories=Settings;DesktopSettings;
+Keywords=mime;mimetype;default;associations;file;applications;mimeapps;
