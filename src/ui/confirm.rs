@@ -18,7 +18,7 @@ pub fn draw(f: &mut Frame, app: &App, config: &MimeTuiConfig) {
     let key = Style::default()
         .fg(Theme::parse_color(&config.colors.focus))
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Theme::parse_color(&config.colors.unfocused));
+    let dim = Style::default().fg(Theme::parse_color(&config.colors.secondary));
 
     let text = crate::ui::layout::theme_text_style(config);
     let block = Block::default()

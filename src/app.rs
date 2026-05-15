@@ -139,6 +139,11 @@ pub struct App {
     /// Transient one-line notice (e.g. "Saved 3 edits"). Cleared after a few
     /// seconds so it doesn't accumulate.
     pub flash: Option<(String, Instant)>,
+    /// Set by Ctrl-Z; consumed by the main loop, which tears down the TUI
+    /// state, raises SIGTSTP to suspend the process, and re-arms the TUI on
+    /// resume. Kept as a flag rather than handled inline in `events.rs` so
+    /// terminal setup/teardown stays centralised in `main.rs`.
+    pub pending_suspend: bool,
     pub config: MimeTuiConfig,
     fuzzy_matcher: SkimMatcherV2,
 }
@@ -177,6 +182,7 @@ impl App {
             help_scroll: 0,
             active_preset: None,
             flash: None,
+            pending_suspend: false,
             config,
             fuzzy_matcher: SkimMatcherV2::default(),
         })
@@ -349,54 +355,6 @@ impl App {
             .collect()
     }
 
-    /// All mimes this app has a non-trivial relationship with, in the order
-    /// the by-app view should display them: defaults first, then associated,
-    /// then declared-only. Within each group, sorted by mime id.
-    pub fn mime_list_for_app(&self, app_id: &str) -> Vec<(MimeType, Relation)> {
-        let mut defaults: Vec<MimeType> = Vec::new();
-        let mut associated: Vec<MimeType> = Vec::new();
-        let mut declared_only: Vec<MimeType> = Vec::new();
-
-        for m in &self.mimes {
-            let is_default = self
-                .effective_default_for(&m.id)
-                .map(|a| a.id == app_id)
-                .unwrap_or(false);
-            if is_default {
-                defaults.push(m.clone());
-                continue;
-            }
-            let is_associated = self
-                .effective_associations_for(&m.id)
-                .iter()
-                .any(|a| a.id == app_id);
-            if is_associated {
-                associated.push(m.clone());
-                continue;
-            }
-            // Declared in .desktop but suppressed by mimeapps.list.
-            let declared = self
-                .apps
-                .iter()
-                .find(|a| a.id == app_id)
-                .map(|a| a.handles(&m.id))
-                .unwrap_or(false);
-            if declared {
-                declared_only.push(m.clone());
-            }
-        }
-
-        defaults.sort_by(|a, b| a.id.cmp(&b.id));
-        associated.sort_by(|a, b| a.id.cmp(&b.id));
-        declared_only.sort_by(|a, b| a.id.cmp(&b.id));
-
-        let mut out: Vec<(MimeType, Relation)> = Vec::new();
-        out.extend(defaults.into_iter().map(|m| (m, Relation::Default)));
-        out.extend(associated.into_iter().map(|m| (m, Relation::Associated)));
-        out.extend(declared_only.into_iter().map(|m| (m, Relation::DeclaredOnly)));
-        out
-    }
-
     /// The mime currently highlighted in the by-mime left list, if any.
     pub fn currently_selected_mime(&self) -> Option<&MimeType> {
         let visible = self.visible_mimes();
@@ -445,7 +403,26 @@ impl App {
 
     /// Remove `app_id` from the associations of `mime`. If it was the default,
     /// clear the default too.
+    ///
+    /// Special-cases the "added then removed, all in this session" pattern:
+    /// if the row only exists because of a pending add (no on-disk anchor),
+    /// we just cancel the pending add. Writing a `pending.remove` entry for
+    /// a row that doesn't exist on disk would leave a misleading "going
+    /// away" indicator for something that was never going to be saved.
     pub fn action_remove_assoc(&mut self, mime: &str, app_id: &str) {
+        if !self.is_on_disk(mime, app_id) {
+            // Pure pending-add row. Drop the add and any pending default
+            // that pointed at it — otherwise we'd leave a default pointing
+            // at an app that's no longer associated.
+            self.pending.cancel_add(mime, app_id);
+            if let Some(Some(id)) = self.pending.set_default.get(mime) {
+                if id == app_id {
+                    self.pending.set_default.remove(mime);
+                }
+            }
+            return;
+        }
+
         self.pending.remove_assoc(mime, app_id);
         if self
             .effective_default_for(mime)
@@ -456,9 +433,47 @@ impl App {
         }
     }
 
+    /// True if `app_id` has *any* on-disk presence for `mime` — declared in
+    /// its .desktop's `MimeType=`, listed in `[Added Associations]`, or
+    /// recorded as the default — and isn't currently suppressed by the
+    /// `[Removed Associations]` block. This is the anchor that decides
+    /// whether removing the row needs a `pending.remove` entry or can be
+    /// expressed as a pure cancellation of a pending add.
+    fn is_on_disk(&self, mime: &str, app_id: &str) -> bool {
+        if self.assoc.is_removed(mime, app_id) {
+            return false;
+        }
+        let declared = self
+            .apps
+            .iter()
+            .find(|a| a.id == app_id)
+            .map(|a| a.handles(mime))
+            .unwrap_or(false);
+        let on_disk_added = self
+            .assoc
+            .added
+            .get(mime)
+            .map(|s| s.iter().any(|i| i == app_id))
+            .unwrap_or(false);
+        let on_disk_default = self
+            .assoc
+            .defaults
+            .get(mime)
+            .map(|d| d == app_id)
+            .unwrap_or(false);
+        declared || on_disk_added || on_disk_default
+    }
+
     /// Add `app_id` to the associations of `mime` (used by the pickers).
     pub fn action_add_assoc(&mut self, mime: &str, app_id: &str) {
         self.pending.add_assoc(mime, app_id);
+    }
+
+    /// Reverse a pending removal — the inverse of `action_remove_assoc` for
+    /// `r`'s toggle path. Doesn't add to `pending.add`: if the row was on
+    /// disk to begin with, this returns it to a fully clean state.
+    pub fn action_undo_remove(&mut self, mime: &str, app_id: &str) {
+        self.pending.undo_remove(mime, app_id);
     }
 
     /// What relationship does `app_id` currently have to `mime`, after pending
@@ -488,6 +503,213 @@ impl App {
             return Some(Relation::DeclaredOnly);
         }
         None
+    }
+
+    /// True when the (mime, app) row in the right pane reflects an unsaved
+    /// edit. Used by the by-mime / by-app right-pane renderers to bold the
+    /// row and stamp it with a pending sigil.
+    ///
+    /// Four cases produce "pending":
+    /// 1. The app is in `pending.add[mime]` — a newly-added association.
+    /// 2. The app is in `pending.remove[mime]` — being removed (the row
+    ///    still renders, with strikethrough).
+    /// 3. The app is the pending new default for the mime
+    ///    (`pending.set_default[mime] == Some(Some(app_id))`).
+    /// 4. The app *was* the on-disk default for the mime AND the default is
+    ///    being changed/cleared (`pending.set_default` has any entry for
+    ///    that mime) — i.e. this row is losing its default.
+    pub fn is_pending_row(&self, mime: &str, app_id: &str) -> bool {
+        if self
+            .pending
+            .add
+            .get(mime)
+            .map(|s| s.contains(app_id))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if self.is_pending_removed_row(mime, app_id) {
+            return true;
+        }
+        if let Some(slot) = self.pending.set_default.get(mime) {
+            // New default goes bold.
+            if matches!(slot, Some(id) if id == app_id) {
+                return true;
+            }
+            // Old default also goes bold — its star is being taken away.
+            if let Some(old) = self.assoc.defaults.get(mime) {
+                if old == app_id {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// True when this (mime, app) row is marked for removal. Used by the
+    /// UI to apply the strikethrough modifier on top of the regular pending
+    /// styling.
+    pub fn is_pending_removed_row(&self, mime: &str, app_id: &str) -> bool {
+        self.pending
+            .remove
+            .get(mime)
+            .map(|s| s.contains(app_id))
+            .unwrap_or(false)
+    }
+
+    /// What relation `app_id` would have to `mime` if `pending.remove` didn't
+    /// exist. Mirrors `relation_of` but ignores pending removals so the
+    /// "displayable" lists can show what the user is *about to* remove with
+    /// its original marker (★ / ✓ / ·) still intact.
+    fn relation_excluding_remove(&self, mime: &str, app_id: &str) -> Option<Relation> {
+        // Default check — same precedence as `effective_default_for`, but the
+        // `is_effectively_removed` filter (which honours pending.remove) is
+        // intentionally skipped.
+        let default = if let Some(slot) = self.pending.set_default.get(mime) {
+            slot.as_deref()
+        } else {
+            self.assoc.defaults.get(mime).map(String::as_str)
+        };
+        if default == Some(app_id) {
+            return Some(Relation::Default);
+        }
+
+        let declared = self
+            .apps
+            .iter()
+            .find(|a| a.id == app_id)
+            .map(|a| a.handles(mime))
+            .unwrap_or(false);
+        let on_disk_added = self
+            .assoc
+            .added
+            .get(mime)
+            .map(|s| s.iter().any(|i| i == app_id))
+            .unwrap_or(false);
+        let pending_added = self
+            .pending
+            .add
+            .get(mime)
+            .map(|s| s.contains(app_id))
+            .unwrap_or(false);
+        // The on-disk `[Removed Associations]` block still suppresses rows
+        // — those are permanently removed from the user's view, unrelated
+        // to the current session's pending.remove. Pending re-adds beat it.
+        let suppressed = self.assoc.is_removed(mime, app_id) && !pending_added;
+
+        if (declared || on_disk_added || pending_added) && !suppressed {
+            return Some(Relation::Associated);
+        }
+        if declared {
+            return Some(Relation::DeclaredOnly);
+        }
+        None
+    }
+
+    /// Like `effective_associations_for`, but also includes apps that are
+    /// `pending.remove`d for this mime, paired with a flag so the UI can
+    /// render them with strikethrough. Apps still suppressed by the on-disk
+    /// `[Removed Associations]` block remain filtered out.
+    pub fn displayable_associations_for(
+        &self,
+        mime: &str,
+    ) -> Vec<(&DesktopApp, bool)> {
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for a in &self.apps {
+            if a.handles(mime) && seen.insert(a.id.clone()) {
+                ids.push(a.id.clone());
+            }
+        }
+        if let Some(added) = self.assoc.added.get(mime) {
+            for id in added {
+                if seen.insert(id.clone()) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        if let Some(added) = self.pending.add.get(mime) {
+            for id in added {
+                if seen.insert(id.clone()) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        // Surface pending removals — these are the rows we want to render
+        // with strikethrough so the user sees what they're about to lose.
+        if let Some(removed) = self.pending.remove.get(mime) {
+            for id in removed {
+                if seen.insert(id.clone()) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        // Drop apps suppressed by the on-disk removed list (unless pending
+        // re-adds them). This is the persistent "user removed in a previous
+        // session" state — not session-local.
+        ids.retain(|id| {
+            if self
+                .pending
+                .add
+                .get(mime)
+                .map(|s| s.contains(id))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            !self.assoc.is_removed(mime, id)
+        });
+
+        ids.into_iter()
+            .filter_map(|id| {
+                let app = self.apps.iter().find(|a| a.id == id)?;
+                let removed = self.is_pending_removed_row(mime, &id);
+                Some((app, removed))
+            })
+            .collect()
+    }
+
+    /// Like `mime_list_for_app`, but also includes mimes the user has
+    /// pending-removed for this app — paired with the "would-be" relation
+    /// (what the marker would have shown before the remove) and a
+    /// pending-removed flag.
+    pub fn displayable_mime_list_for_app(
+        &self,
+        app_id: &str,
+    ) -> Vec<(MimeType, Relation, bool)> {
+        let mut defaults: Vec<(MimeType, bool)> = Vec::new();
+        let mut associated: Vec<(MimeType, bool)> = Vec::new();
+        let mut declared_only: Vec<(MimeType, bool)> = Vec::new();
+
+        for m in &self.mimes {
+            let removed = self.is_pending_removed_row(&m.id, app_id);
+            let rel = self.relation_excluding_remove(&m.id, app_id);
+            match rel {
+                Some(Relation::Default) => defaults.push((m.clone(), removed)),
+                Some(Relation::Associated) => associated.push((m.clone(), removed)),
+                Some(Relation::DeclaredOnly) => declared_only.push((m.clone(), removed)),
+                None => {}
+            }
+        }
+
+        defaults.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        associated.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        declared_only.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+
+        let mut out = Vec::new();
+        out.extend(defaults.into_iter().map(|(m, r)| (m, Relation::Default, r)));
+        out.extend(
+            associated
+                .into_iter()
+                .map(|(m, r)| (m, Relation::Associated, r)),
+        );
+        out.extend(
+            declared_only
+                .into_iter()
+                .map(|(m, r)| (m, Relation::DeclaredOnly, r)),
+        );
+        out
     }
 
     /// "Toggle on" if currently off (None or DeclaredOnly), "off" if currently
@@ -849,6 +1071,7 @@ impl App {
             help_scroll: 0,
             active_preset: None,
             flash: None,
+            pending_suspend: false,
             config: MimeTuiConfig::default(),
             fuzzy_matcher: SkimMatcherV2::default(),
         }
@@ -950,6 +1173,283 @@ mod tests {
             .map(|a| a.id.as_str())
             .collect();
         assert_eq!(remaining, vec!["chromium.desktop"]);
+    }
+
+    #[test]
+    fn is_pending_row_flags_pending_add() {
+        let (apps, mimes, mut assoc) = sample_world();
+        // Treat firefox as a fresh app that *doesn't* declare text/html on
+        // disk, so action_add_assoc actually lands in pending.add (not a
+        // no-op against the declared-only baseline).
+        assoc
+            .added
+            .entry("text/html".into())
+            .or_default()
+            .insert("chromium.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+        // Remove firefox from declarations so add is unambiguous.
+        app.apps[0].mime_types.clear();
+        app.action_add_assoc("text/html", "firefox.desktop");
+        assert!(app.is_pending_row("text/html", "firefox.desktop"));
+        // chromium is on disk, no pending edit → not pending.
+        assert!(!app.is_pending_row("text/html", "chromium.desktop"));
+    }
+
+    #[test]
+    fn is_pending_row_flags_new_and_old_default_on_default_change() {
+        let (apps, mimes, mut assoc) = sample_world();
+        // On-disk default: firefox.
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+        app.action_set_default("text/html", "chromium.desktop");
+        // chromium becomes the new default → pending.
+        assert!(app.is_pending_row("text/html", "chromium.desktop"));
+        // firefox loses default → also pending (its star is going away).
+        assert!(app.is_pending_row("text/html", "firefox.desktop"));
+    }
+
+    #[test]
+    fn is_pending_row_flags_old_default_on_clear() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+        app.action_clear_default("text/html");
+        assert!(app.is_pending_row("text/html", "firefox.desktop"));
+        // Unrelated app is unaffected.
+        assert!(!app.is_pending_row("text/html", "chromium.desktop"));
+    }
+
+    #[test]
+    fn is_pending_row_flags_pending_remove() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .added
+            .entry("text/html".into())
+            .or_default()
+            .insert("chromium.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+        app.action_remove_assoc("text/html", "chromium.desktop");
+        assert!(app.is_pending_row("text/html", "chromium.desktop"));
+        assert!(app.is_pending_removed_row("text/html", "chromium.desktop"));
+    }
+
+    #[test]
+    fn displayable_assoc_keeps_pending_removed_rows() {
+        let (apps, mimes, mut assoc) = sample_world();
+        // Both apps declare text/html via .desktop, so both appear in the
+        // effective list. After removing one, the effective list drops it
+        // but the displayable list keeps it.
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+        assert_eq!(app.effective_associations_for("text/html").len(), 2);
+
+        app.action_remove_assoc("text/html", "chromium.desktop");
+        assert_eq!(
+            app.effective_associations_for("text/html").len(),
+            1,
+            "effective list drops the pending-removed row"
+        );
+
+        let displayable = app.displayable_associations_for("text/html");
+        assert_eq!(
+            displayable.len(),
+            2,
+            "displayable list keeps the pending-removed row visible"
+        );
+        let removed_flags: Vec<(String, bool)> = displayable
+            .iter()
+            .map(|(a, r)| (a.id.clone(), *r))
+            .collect();
+        assert!(removed_flags.contains(&("chromium.desktop".into(), true)));
+        assert!(removed_flags.contains(&("firefox.desktop".into(), false)));
+    }
+
+    #[test]
+    fn displayable_mime_list_for_app_keeps_pending_removed_rows() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        // Baseline: chromium has Associated relation for text/html (it
+        // declares the mime in its .desktop).
+        let baseline = app.displayable_mime_list_for_app("chromium.desktop");
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].1, Relation::Associated);
+        assert!(!baseline[0].2, "no pending edits → not flagged removed");
+
+        app.action_remove_assoc("text/html", "chromium.desktop");
+
+        // Displayable view keeps the row with its *pre-remove* relation
+        // (Associated, not the post-remove DeclaredOnly fallthrough), and
+        // sets the pending-removed flag so the UI can strikethrough it.
+        let after = app.displayable_mime_list_for_app("chromium.desktop");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0.id, "text/html");
+        assert_eq!(after[0].1, Relation::Associated);
+        assert!(after[0].2, "expected pending-removed flag true");
+    }
+
+    #[test]
+    fn displayable_mime_list_preserves_default_marker_on_remove() {
+        let (apps, mimes, mut assoc) = sample_world();
+        // firefox is the default for text/html.
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        // User presses `r` on the default app. The marker should stay ★
+        // in the displayable view so the user sees they're removing the
+        // current default.
+        app.action_remove_assoc("text/html", "firefox.desktop");
+
+        let displayable = app.displayable_mime_list_for_app("firefox.desktop");
+        let row = displayable
+            .iter()
+            .find(|(m, _, _)| m.id == "text/html")
+            .expect("firefox should still appear in displayable list");
+        assert!(row.2, "pending-removed flag should be true");
+        assert_eq!(
+            row.1,
+            Relation::Default,
+            "would-be relation should preserve the ★ marker"
+        );
+    }
+
+    #[test]
+    fn remove_cancels_pending_add_for_off_disk_row() {
+        // Build a world where firefox is the only declared handler for
+        // text/html, so adding a third app means a pure pending.add row
+        // with no on-disk anchor.
+        let (mut apps, mimes, assoc) = sample_world();
+        apps.push(DesktopApp {
+            id: "elinks.desktop".into(),
+            name: "ELinks".into(),
+            comment: "".into(),
+            exec: "elinks".into(),
+            terminal: true,
+            mime_types: vec![], // doesn't declare text/html
+            category: "Network".into(),
+        });
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        // Add an off-disk app via the picker path.
+        app.action_add_assoc("text/html", "elinks.desktop");
+        assert!(app.is_dirty());
+        assert_eq!(app.pending.count(), 1);
+
+        // Pressing `r` on this newly-added row should fully undo the edit —
+        // no pending.remove entry, no lingering pending.add.
+        app.action_remove_assoc("text/html", "elinks.desktop");
+        assert_eq!(
+            app.pending.count(),
+            0,
+            "added-then-removed off-disk row should leave pending edits empty"
+        );
+        assert!(!app.is_dirty());
+        // And it disappears from the displayable list (no on-disk anchor,
+        // no pending edit to keep it visible).
+        let displayable: Vec<&str> = app
+            .displayable_associations_for("text/html")
+            .iter()
+            .map(|(a, _)| a.id.as_str())
+            .collect();
+        assert!(
+            !displayable.contains(&"elinks.desktop"),
+            "row should vanish, not stay as strikethrough"
+        );
+    }
+
+    #[test]
+    fn remove_cancels_pending_default_for_off_disk_row() {
+        // User adds an off-disk app, sets it as default, then removes it.
+        // The pending default should be cleaned up too — otherwise we'd
+        // leave a dangling default pointing at an unassociated app.
+        let (mut apps, mimes, assoc) = sample_world();
+        apps.push(DesktopApp {
+            id: "elinks.desktop".into(),
+            name: "ELinks".into(),
+            comment: "".into(),
+            exec: "elinks".into(),
+            terminal: true,
+            mime_types: vec![],
+            category: "Network".into(),
+        });
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        app.action_add_assoc("text/html", "elinks.desktop");
+        app.action_set_default("text/html", "elinks.desktop");
+        assert!(app.pending.set_default.contains_key("text/html"));
+
+        app.action_remove_assoc("text/html", "elinks.desktop");
+        assert!(
+            !app.pending.set_default.contains_key("text/html"),
+            "pending.set_default should be cleaned up when its target is cancelled"
+        );
+        assert_eq!(app.pending.count(), 0);
+    }
+
+    #[test]
+    fn remove_of_on_disk_row_still_uses_pending_remove() {
+        // Sanity: the off-disk shortcut must not change the behaviour of
+        // removing a row that *does* have an on-disk anchor.
+        let (apps, mimes, mut assoc) = sample_world();
+        // chromium is declared via .desktop already; also put it in
+        // [Added Associations] to make sure both paths are exercised.
+        assoc
+            .added
+            .entry("text/html".into())
+            .or_default()
+            .insert("chromium.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        app.action_remove_assoc("text/html", "chromium.desktop");
+        assert!(app.is_pending_removed_row("text/html", "chromium.desktop"));
+        assert_eq!(app.pending.count(), 1);
+    }
+
+    #[test]
+    fn undo_remove_returns_row_to_clean_state() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .added
+            .entry("text/html".into())
+            .or_default()
+            .insert("firefox.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        app.action_remove_assoc("text/html", "firefox.desktop");
+        assert!(app.is_pending_removed_row("text/html", "firefox.desktop"));
+        assert_eq!(app.pending.count(), 1);
+
+        app.action_undo_remove("text/html", "firefox.desktop");
+
+        // pending.remove is gone, and crucially pending.add is NOT populated
+        // (which is what add_assoc would have done) — so the row is back to
+        // its clean on-disk state with no net edit.
+        assert!(!app.is_pending_removed_row("text/html", "firefox.desktop"));
+        assert!(!app.is_pending_row("text/html", "firefox.desktop"));
+        assert_eq!(app.pending.count(), 0);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn is_pending_row_false_for_clean_state() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("text/html".into(), "firefox.desktop".into());
+        let app = App::for_test(apps, mimes, assoc);
+        assert!(!app.is_pending_row("text/html", "firefox.desktop"));
+        assert!(!app.is_pending_row("text/html", "chromium.desktop"));
     }
 
     #[test]

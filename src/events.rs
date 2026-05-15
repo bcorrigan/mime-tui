@@ -10,6 +10,17 @@ use crate::app::{App, Focus, Mode, SaveResult, View};
 
 /// Returns Ok(true) when the app should exit cleanly.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    // Ctrl-Z suspends regardless of mode, matching shell convention. The
+    // actual teardown/resume dance happens in main.rs because that's where
+    // the terminal handle lives; we just flag it here.
+    if matches!(
+        (key.code, key.modifiers),
+        (KeyCode::Char('z'), KeyModifiers::CONTROL)
+    ) {
+        app.pending_suspend = true;
+        return Ok(false);
+    }
+
     match app.mode.clone() {
         Mode::Browse => handle_key_browse(app, key),
         Mode::PickApp { .. } | Mode::PickMime { .. } => handle_key_picker(app, key),
@@ -31,13 +42,6 @@ fn handle_key_browse(app: &mut App, key: KeyEvent) -> Result<bool> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
             do_save(app);
-            return Ok(false);
-        }
-        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
-            if app.is_dirty() {
-                app.action_discard();
-                app.set_flash("Discarded pending edits.");
-            }
             return Ok(false);
         }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
@@ -297,19 +301,24 @@ fn left_pane_count(app: &App) -> usize {
 }
 
 fn right_pane_count(app: &App) -> usize {
+    // The right pane renders the *displayable* lists (which keep
+    // pending-removed rows visible-with-strikethrough). Indexing/clamping
+    // must match — otherwise `selected_right` drifts relative to the rows
+    // the user actually sees, which is how repeated `r` ended up removing
+    // unrelated items further down the list.
     match app.view {
         View::ByMime => {
             let Some(m) = app.currently_selected_mime() else {
                 return 0;
             };
             let mime_id = m.id.clone();
-            app.effective_associations_for(&mime_id).len()
+            app.displayable_associations_for(&mime_id).len()
         }
         View::ByApp => {
             let Some(a) = app.currently_selected_app() else {
                 return 0;
             };
-            app.mime_list_for_app(&a.id).len()
+            app.displayable_mime_list_for_app(&a.id).len()
         }
     }
 }
@@ -329,20 +338,23 @@ fn reset_left_selection(app: &mut App) {
 /// the *what it returns* axis — the third element is always the app's display
 /// name, so flash-message templates can be written once.
 fn target_pair(app: &App) -> Option<(String, String, String)> {
+    // Index into the *displayable* lists so the (mime, app) we resolve
+    // matches the row the user has highlighted — including pending-removed
+    // rows that the UI keeps visible with strikethrough.
     match app.view {
         View::ByMime => {
             let mime = app.currently_selected_mime()?;
             let mime_id = mime.id.clone();
-            let assoc = app.effective_associations_for(&mime_id);
-            let entry = assoc.get(app.selected_right)?;
+            let assoc = app.displayable_associations_for(&mime_id);
+            let (entry, _is_removed) = assoc.get(app.selected_right)?;
             Some((mime_id, entry.id.clone(), entry.name.clone()))
         }
         View::ByApp => {
             let a = app.currently_selected_app()?;
             let app_id = a.id.clone();
             let app_name = a.name.clone();
-            let list = app.mime_list_for_app(&app_id);
-            let (mime, _rel) = list.get(app.selected_right)?;
+            let list = app.displayable_mime_list_for_app(&app_id);
+            let (mime, _rel, _is_removed) = list.get(app.selected_right)?;
             Some((mime.id.clone(), app_id, app_name))
         }
     }
@@ -363,13 +375,27 @@ fn action_remove(app: &mut App) {
     let Some((mime_id, app_id, app_name)) = target_pair(app) else {
         return;
     };
-    app.action_remove_assoc(&mime_id, &app_id);
-    app.set_flash(format!(
-        "{} is no longer associated with {}",
-        app_name, mime_id
-    ));
+    // Toggle: pressing `r` on an already-pending-removed row un-removes it
+    // rather than re-asserting the (idempotent) remove. This makes `r` the
+    // natural inverse of itself and avoids the previous footgun where
+    // repeated taps walked down the effective list.
+    if app.is_pending_removed_row(&mime_id, &app_id) {
+        app.action_undo_remove(&mime_id, &app_id);
+        app.set_flash(format!(
+            "{} restored — no longer pending removal from {}",
+            app_name, mime_id
+        ));
+    } else {
+        app.action_remove_assoc(&mime_id, &app_id);
+        app.set_flash(format!(
+            "{} is no longer associated with {}",
+            app_name, mime_id
+        ));
+    }
 
-    // Keep right-pane selection in bounds.
+    // Keep right-pane selection in bounds. The displayable count is stable
+    // across an r-toggle (removed rows stay visible), so in practice this
+    // only fires when the displayable list is genuinely empty.
     let new_count = right_pane_count(app);
     if new_count == 0 {
         app.focus = Focus::Left;
@@ -451,10 +477,19 @@ fn handle_key_picker(app: &mut App, key: KeyEvent) -> Result<bool> {
             return Ok(false);
         }
 
-        // Toggle: Space or Enter on the cursor row (or the marked range).
-        // Picker stays open so the user can rapidly toggle many entries.
-        (KeyCode::Char(' '), KeyModifiers::NONE) | (KeyCode::Enter, _) => {
+        // Space toggles the cursor row (or the marked range) and stays in
+        // the picker — meant for rapid multi-entry editing.
+        (KeyCode::Char(' '), KeyModifiers::NONE) => {
             app.picker_apply_toggle();
+            return Ok(false);
+        }
+
+        // Enter is the "accept" key — toggle, then dismiss the modal. The
+        // user has signalled "I'm done picking", so we hand them back to
+        // the main view instead of waiting for an Esc.
+        (KeyCode::Enter, _) => {
+            app.picker_apply_toggle();
+            app.close_picker();
             return Ok(false);
         }
 

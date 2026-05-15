@@ -17,3 +17,4 @@ ratatui = "0.30.0"
 toml = "1.1"
 rusqlite = { version = "0.39", features = ["bundled"] }
 quick-xml = "0.39"
+libc = "0.2"

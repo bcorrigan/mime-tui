@@ -231,7 +231,11 @@ const SOLARIZED_LIGHT: Palette = Palette {
     unfocused: "#eee8d5",        // base2
     highlight: "#b58900",        // yellow
     text: "#586e75",             // base01 — Solarized's "body text" colour
-    secondary: "#93a1a1",
+    // base00 instead of the canonical base1 — base1 is Solarized's
+    // "comment" colour, deliberately faint, which read as unreadable in
+    // our status-bar and detail-pane hints. base00 is one step darker:
+    // still subordinate to `text`, but legible on the cream bg.
+    secondary: "#657b83",
     selection_fg: "#002b36",     // base03 (darkest) — readable on yellow
     scrollbar_thumb: "#268bd2",
     scrollbar_track: "#eee8d5",
@@ -501,10 +505,12 @@ fn parse_toml_config(content: &str) -> Result<MimeTuiConfig, toml::de::Error> {
 
 /// Several theme fields default to "empty means follow another field". This
 /// resolves those at load time so the renderer sees concrete hex strings.
+///
+/// `cursor_color` is intentionally NOT in this list — empty means "don't
+/// touch the terminal cursor at all" (skip the OSC 12 sequence on startup
+/// and the OSC 112 reset on exit). Users who want a themed cursor set it
+/// explicitly.
 fn resolve_fallback_colors(cfg: &mut MimeTuiConfig) {
-    if cfg.colors.cursor_color.trim().is_empty() {
-        cfg.colors.cursor_color = cfg.colors.focus.clone();
-    }
     if cfg.colors.scrollbar_thumb.trim().is_empty() {
         cfg.colors.scrollbar_thumb = cfg.colors.focus.clone();
     }
@@ -738,15 +744,25 @@ mod tests {
     }
 
     #[test]
-    fn cursor_color_falls_back_to_focus_when_empty() {
+    fn cursor_color_stays_empty_when_unset() {
+        // Empty `cursor_color` means "don't touch the terminal cursor".
+        // Previously we fell back to `focus`, which forced a themed cursor
+        // on every preset — that didn't match what most users actually
+        // want (and stomps on their terminal's own cursor styling).
+        let cfg = parse_toml_config("").unwrap();
+        assert_eq!(cfg.colors.cursor_color, "");
+    }
+
+    #[test]
+    fn cursor_color_honoured_when_set() {
         let cfg = parse_toml_config(
             r##"
             [theme]
-            focus = "#112233"
+            cursor_color = "#ff00ff"
             "##,
         )
         .unwrap();
-        assert_eq!(cfg.colors.cursor_color, "#112233");
+        assert_eq!(cfg.colors.cursor_color, "#ff00ff");
     }
 
     // ── presets ──────────────────────────────────────────────────────

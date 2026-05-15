@@ -64,7 +64,7 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
 
     let border = Theme::parse_color(&config.colors.focus);
     let key = Style::default().add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Theme::parse_color(&config.colors.unfocused));
+    let dim = Style::default().fg(Theme::parse_color(&config.colors.secondary));
 
     let text = layout::theme_text_style(config);
     let block = Block::default()
@@ -125,8 +125,10 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
     let mark_active = app.pick_mark.is_some();
     let hint = if mark_active {
         Line::from(vec![
-            Span::styled(" Space/Enter", key),
+            Span::styled(" Space", key),
             Span::styled(": toggle range  ", dim),
+            Span::styled("Enter", key),
+            Span::styled(": accept  ", dim),
             Span::styled("Ctrl-Space", key),
             Span::styled(": clear mark  ", dim),
             Span::styled("Esc", key),
@@ -134,8 +136,10 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
         ])
     } else {
         Line::from(vec![
-            Span::styled(" Space/Enter", key),
+            Span::styled(" Space", key),
             Span::styled(": toggle  ", dim),
+            Span::styled("Enter", key),
+            Span::styled(": accept  ", dim),
             Span::styled("Ctrl-Space", key),
             Span::styled(": set mark  ", dim),
             Span::styled("Esc", key),

@@ -5,7 +5,7 @@ use crate::ui::layout;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
@@ -92,7 +92,7 @@ fn render_summary(
     config: &MimeTuiConfig,
 ) {
     let border_color = Theme::parse_color(&config.colors.border);
-    let dim = Style::default().fg(Theme::parse_color(&config.colors.unfocused));
+    let dim = Style::default().fg(Theme::parse_color(&config.colors.secondary));
 
     let title = selected
         .map(|a| format!(" {} ", a.name))
@@ -146,22 +146,43 @@ fn render_mimes_list(
     };
 
     let app_id = a.id.clone();
-    let list = app.mime_list_for_app(&app_id);
+    let list = app.displayable_mime_list_for_app(&app_id);
     let secondary = Style::default().fg(Theme::parse_color(&config.colors.secondary));
+    let pending_style = Style::default()
+        .fg(Theme::parse_color(&config.colors.focus))
+        .add_modifier(Modifier::BOLD);
 
     // Build each row as a Line so the relation marker can carry its own
     // themed colour. Layout per row:
     //
-    //   span[0] = relation marker (★ / ✓ / · — styled by marker_style)
-    //   span[1] = " "  (1-char separator, raw)
-    //   span[2] = mime id (raw)
-    //   span[3] = " (default)" / " (declared, not associated)" (dim) if any
+    //   span[0] = pending sigil ("*" or " " — styled by pending_style)
+    //   span[1] = " "  (1-char separator)
+    //   span[2] = relation marker (★ / ✓ / · — styled by marker_style)
+    //   span[3] = " "  (1-char separator, raw)
+    //   span[4] = mime id (bold when pending, strikethrough when removed)
+    //   span[5] = " (default)" / " (declared, not associated)" (dim) if any
     //
-    // pin_count = 2 keeps the marker + its trailing space stuck at the
-    // left edge when horizontally scrolled.
+    // pin_count = 4 keeps the [sigil + space + marker + space] prefix stuck
+    // at the left edge when horizontally scrolled.
     let items: Vec<Line<'static>> = list
         .iter()
-        .map(|(m, rel)| {
+        .map(|(m, rel, is_removed)| {
+            let is_pending = app.is_pending_row(&m.id, &app_id);
+            let sigil = if is_pending { "*" } else { " " };
+            // Strikethrough is the dominant cue for "going away" — drop
+            // bold so the row reads as subdued, not emphasised.
+            let id_style = if *is_removed {
+                Style::default().add_modifier(Modifier::CROSSED_OUT)
+            } else if is_pending {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let suffix_style = if *is_removed {
+                secondary.add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                secondary
+            };
             let rel_char = match rel {
                 Relation::Default => "★",
                 Relation::Associated => "✓",
@@ -173,12 +194,14 @@ fn render_mimes_list(
                 Relation::DeclaredOnly => "  (declared, not associated)",
             };
             let mut spans = vec![
+                Span::styled(sigil.to_string(), pending_style),
+                Span::raw(" "),
                 Span::styled(rel_char.to_string(), marker_style(*rel, config)),
                 Span::raw(" "),
-                Span::raw(m.id.clone()),
+                Span::styled(m.id.clone(), id_style),
             ];
             if !suffix.is_empty() {
-                spans.push(Span::styled(suffix.to_string(), secondary));
+                spans.push(Span::styled(suffix.to_string(), suffix_style));
             }
             Line::from(spans)
         })
@@ -193,7 +216,7 @@ fn render_mimes_list(
 
     let scrolled: Vec<Line<'static>> = items
         .iter()
-        .map(|l| layout::scroll_line(l, hscroll, 2))
+        .map(|l| layout::scroll_line(l, hscroll, 4))
         .collect();
 
     let focus_right = app.focus == Focus::Right;
@@ -210,8 +233,4 @@ fn render_mimes_list(
         &mut app.right_list_state,
     );
     layout::render_list_hscrollbar(f, area, max_content_w, hscroll, config);
-
-    // Silence the spurious "unused" of Span in this module — we use it through
-    // the Line constructor only via &str transparently. (No-op statement.)
-    let _ = Span::raw("");
 }

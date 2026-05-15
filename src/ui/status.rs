@@ -63,7 +63,7 @@ fn build_chunks(app: &App, config: &MimeTuiConfig) -> Vec<Chunk> {
     let key = Style::default()
         .fg(Theme::parse_color(&config.colors.focus))
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Theme::parse_color(&config.colors.unfocused));
+    let dim = Style::default().fg(Theme::parse_color(&config.colors.secondary));
 
     let mut chunks: Vec<Chunk> = Vec::new();
 
@@ -83,29 +83,36 @@ fn build_chunks(app: &App, config: &MimeTuiConfig) -> Vec<Chunk> {
     match &app.mode {
         Mode::Browse => browse_chunks(&mut chunks, app, key, dim),
         Mode::PickApp { .. } | Mode::PickMime { .. } => {
-            chunks.push(kv_chunk("Enter", ":add", key, dim));
+            chunks.push(kv_chunk("Space", ":toggle", key, dim));
+            chunks.push(kv_chunk("Enter", ":accept", key, dim));
+            chunks.push(sep_chunk(dim));
             chunks.push(kv_chunk("Esc", ":cancel", key, dim));
         }
         Mode::ConfirmQuit => {
             chunks.push(kv_chunk("y", ":discard", key, dim));
             chunks.push(kv_chunk("s", ":save", key, dim));
+            chunks.push(sep_chunk(dim));
             chunks.push(kv_chunk("n", ":cancel", key, dim));
         }
         Mode::Help => {
             chunks.push(kv_chunk("Space/PgDn", ":page down", key, dim));
             chunks.push(kv_chunk("b/PgUp", ":page up", key, dim));
             chunks.push(kv_chunk("↑/↓", ":line", key, dim));
+            chunks.push(sep_chunk(dim));
             chunks.push(kv_chunk("q/Esc", ":close", key, dim));
         }
         Mode::ConflictResolve { .. } => {
             chunks.push(kv_chunk("r", ":reload", key, dim));
             chunks.push(kv_chunk("o", ":overwrite", key, dim));
             chunks.push(kv_chunk("m", ":merge", key, dim));
+            chunks.push(sep_chunk(dim));
             chunks.push(kv_chunk("c/Esc", ":cancel", key, dim));
         }
         Mode::ThemePick { .. } => {
             chunks.push(kv_chunk("↑↓", ":preview", key, dim));
+            chunks.push(sep_chunk(dim));
             chunks.push(kv_chunk("Enter", ":keep", key, dim));
+            chunks.push(sep_chunk(dim));
             chunks.push(kv_chunk("Esc", ":cancel", key, dim));
         }
     }
@@ -114,27 +121,36 @@ fn build_chunks(app: &App, config: &MimeTuiConfig) -> Vec<Chunk> {
 }
 
 fn browse_chunks(chunks: &mut Vec<Chunk>, app: &App, key: Style, dim: Style) {
+    // Group 1 — navigation: switch view + move between panes.
     chunks.push(kv_chunk("Tab", ":view", key, dim));
-
     if app.focus == Focus::Right {
-        let (remove_label, add_label) = match app.view {
-            View::ByMime => ("remove app", "add app"),
-            View::ByApp => ("remove mime", "add mime"),
-        };
-        chunks.push(kv_chunk("d", ":set default", key, dim));
-        chunks.push(kv_chunk_owned("r", format!(":{}", remove_label), key, dim));
-        chunks.push(kv_chunk("c", ":clear default", key, dim));
-        chunks.push(kv_chunk_owned("a", format!(":{}", add_label), key, dim));
         chunks.push(kv_chunk("←", ":back", key, dim));
     } else {
         chunks.push(kv_chunk("→", ":edit", key, dim));
     }
 
-    chunks.push(kv_chunk("Ctrl-S", ":save", key, dim));
-    if app.is_dirty() {
-        chunks.push(kv_chunk("Ctrl-Z", ":discard", key, dim));
+    // Group 2 — operations on the current row (only meaningful when the
+    // right pane is focused, since that's where edits happen).
+    if app.focus == Focus::Right {
+        let (remove_label, add_label) = match app.view {
+            View::ByMime => ("remove app", "add app"),
+            View::ByApp => ("remove mime", "add mime"),
+        };
+        chunks.push(sep_chunk(dim));
+        chunks.push(kv_chunk_owned("a", format!(":{}", add_label), key, dim));
+        chunks.push(kv_chunk("d", ":set default", key, dim));
+        chunks.push(kv_chunk("c", ":clear default", key, dim));
+        chunks.push(kv_chunk_owned("r", format!(":{}", remove_label), key, dim));
     }
-    chunks.push(kv_chunk("Ctrl-T", ":theme", key, dim));
+
+    // Group 3 — misc: save/discard, then top-level utilities. Ctrl-T is a
+    // top-level affordance — hide it on the right pane to keep that hint
+    // bar focused on row operations.
+    chunks.push(sep_chunk(dim));
+    chunks.push(kv_chunk("Ctrl-S", ":save", key, dim));
+    if app.focus == Focus::Left {
+        chunks.push(kv_chunk("Ctrl-T", ":theme", key, dim));
+    }
     chunks.push(kv_chunk("?", ":help", key, dim));
     chunks.push(kv_chunk("Esc", ":quit", key, dim));
 }
@@ -145,6 +161,14 @@ fn kv_chunk(k: &'static str, v: &'static str, key: Style, dim: Style) -> Chunk {
 
 fn kv_chunk_owned(k: &'static str, v: String, key: Style, dim: Style) -> Chunk {
     vec![Span::styled(k, key), Span::styled(v, dim)]
+}
+
+/// A thin vertical bar used to visually separate groups of hints
+/// (navigation │ operations │ misc). Treated as a full chunk so the layout
+/// engine keeps it whole and surrounds it with the regular two-space
+/// chunk separators on either side.
+fn sep_chunk(dim: Style) -> Chunk {
+    vec![Span::styled("│", dim)]
 }
 
 /// Pack chunks left-to-right into lines of width `width`. A chunk never

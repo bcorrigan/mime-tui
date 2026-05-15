@@ -124,4 +124,29 @@ impl PendingEdits {
             .or_default()
             .insert(id.to_string());
     }
+
+    /// Undo a pending removal without otherwise touching the edit set. Used
+    /// by the `r`-toggle: pressing `r` on a pending-removed row should bring
+    /// the row back to its on-disk state, *not* coerce it into pending.add
+    /// (which is what `add_assoc` would do).
+    pub fn undo_remove(&mut self, mime: &str, id: &str) {
+        if let Some(s) = self.remove.get_mut(mime) {
+            s.remove(id);
+            if s.is_empty() {
+                self.remove.remove(mime);
+            }
+        }
+    }
+
+    /// Drop a pending add for (mime, id) without writing anything to the
+    /// remove set. Used by `App::action_remove_assoc` to express
+    /// "add-then-remove → no edit" when the row never existed on disk.
+    pub fn cancel_add(&mut self, mime: &str, id: &str) {
+        if let Some(s) = self.add.get_mut(mime) {
+            s.remove(id);
+            if s.is_empty() {
+                self.add.remove(mime);
+            }
+        }
+    }
 }

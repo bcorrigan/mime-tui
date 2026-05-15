@@ -106,7 +106,7 @@ fn render_summary(
     let heading = Style::default()
         .fg(Theme::parse_color(&config.colors.focus))
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Theme::parse_color(&config.colors.unfocused));
+    let dim = Style::default().fg(Theme::parse_color(&config.colors.secondary));
 
     let title = mime
         .map(|m| format!(" {} ", m.id))
@@ -185,37 +185,73 @@ fn render_associations(
         return;
     };
     let mime_id = m.id.clone();
-    let assoc = app.effective_associations_for(&mime_id);
+    let assoc = app.displayable_associations_for(&mime_id);
 
-    let default_id = app.effective_default_for(&mime_id).map(|d| d.id.clone());
+    // For the "(default)" suffix we want the *would-be* default — the app
+    // that holds the star when ignoring pending.remove. `effective_default_for`
+    // returns None when the current default is pending-removed, which would
+    // hide the marker; we want to keep it so the user sees what they're
+    // removing.
+    let would_be_default_id: Option<String> = if let Some(slot) =
+        app.pending.set_default.get(&mime_id)
+    {
+        // A pending default-change wins.
+        slot.clone()
+    } else {
+        app.assoc.defaults.get(&mime_id).cloned()
+    };
+    let dim = Style::default().fg(Theme::parse_color(&config.colors.secondary));
+    let pending_style = Style::default()
+        .fg(Theme::parse_color(&config.colors.focus))
+        .add_modifier(Modifier::BOLD);
 
-    let items: Vec<String> = assoc
+    // Each row: [pending-sigil][space][name][optional "  (default)" suffix].
+    // pin_count = 2 so the sigil + its trailing space stay anchored at the
+    // left edge when the row is horizontally scrolled.
+    let items: Vec<Line<'static>> = assoc
         .iter()
-        .map(|e| {
-            let marker = if Some(&e.id) == default_id.as_ref() {
-                "  (default)"
+        .map(|(e, is_removed)| {
+            let is_pending = app.is_pending_row(&mime_id, &e.id);
+            let is_default = Some(&e.id) == would_be_default_id.as_ref();
+            let sigil = if is_pending { "*" } else { " " };
+            // Strikethrough wins as the dominant visual cue for removals —
+            // we drop the bold to keep the row looking subdued ("going
+            // away") rather than emphasised ("look at me").
+            let name_style = if *is_removed {
+                Style::default().add_modifier(Modifier::CROSSED_OUT)
+            } else if is_pending {
+                Style::default().add_modifier(Modifier::BOLD)
             } else {
-                ""
+                Style::default()
             };
-            format!("{}{}", e.name, marker)
+            let suffix_style = if *is_removed {
+                dim.add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                dim
+            };
+            let mut spans = vec![
+                Span::styled(sigil.to_string(), pending_style),
+                Span::raw(" "),
+                Span::styled(e.name.clone(), name_style),
+            ];
+            if is_default {
+                spans.push(Span::styled("  (default)".to_string(), suffix_style));
+            }
+            Line::from(spans)
         })
         .collect();
 
     // Associations are usually app names (short), but a verbose
     // "(default)" suffix can still overflow on narrow panes.
-    let max_content_w: usize = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let max_content_w: usize = items.iter().map(|l| l.width()).max().unwrap_or(0);
     let inner_w = (area.width as usize).saturating_sub(4);
     let hscroll = (app.right_hscroll as usize).min(max_content_w.saturating_sub(inner_w));
     app.right_hscroll = hscroll as u16;
 
-    let scrolled: Vec<String> = if hscroll == 0 {
-        items
-    } else {
-        items
-            .iter()
-            .map(|s| s.chars().skip(hscroll).collect::<String>())
-            .collect()
-    };
+    let scrolled: Vec<Line<'static>> = items
+        .iter()
+        .map(|l| layout::scroll_line(l, hscroll, 2))
+        .collect();
 
     let focus_right = app.focus == Focus::Right;
     let clamped = app.selected_right.min(scrolled.len().saturating_sub(1));
@@ -223,7 +259,7 @@ fn render_associations(
     // on the left, the right pane is just informational — a "ghost" selection
     // here would imply navigability that isn't actually active.
     let selected = if focus_right { Some(clamped) } else { None };
-    layout::render_list(
+    layout::render_list_lines(
         f,
         area,
         " Associations ",
