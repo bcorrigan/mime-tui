@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::KeyEvent;
@@ -138,6 +138,13 @@ pub struct App {
     /// Fast membership lookup over `phantom_apps`. Kept in sync via
     /// `recompute_phantoms`.
     pub phantom_ids: HashSet<String>,
+    /// Inverse index: `mime → installed app ids that declare it via
+    /// `MimeType=`. Built once from `apps` because `apps` never mutates
+    /// after construction — pending edits and saves both leave the
+    /// installed-app set alone. Lets per-frame predicates like
+    /// `has_any_effective_association` skip the O(apps × mime_types)
+    /// scan that `effective_associations_for` does.
+    pub mime_declarers: HashMap<String, Vec<String>>,
     pub mimes: Vec<MimeType>,
     pub assoc: OnDiskAssoc,
     /// Snapshot of the user's `mimeapps.list` at startup. Conflict detection
@@ -224,6 +231,7 @@ impl App {
         let (apps, mimes, assoc) = load_world()?;
         let user_baseline = storage::mimeapps::read_user_file_baseline();
         let (phantom_apps, phantom_ids) = compute_phantoms(&apps, &assoc);
+        let mime_declarers = compute_mime_declarers(&apps);
         Ok(Self {
             view: View::ByApp,
             focus: Focus::Left,
@@ -234,6 +242,7 @@ impl App {
             apps,
             phantom_apps,
             phantom_ids,
+            mime_declarers,
             mimes,
             assoc,
             user_baseline,
@@ -463,6 +472,51 @@ impl App {
         ids.into_iter()
             .filter_map(|id| self.apps.iter().find(|a| a.id == id))
             .collect()
+    }
+
+    /// Short-circuiting twin of `effective_associations_for(mime).is_empty()`.
+    /// Returns `true` as soon as it finds the first installed app whose
+    /// effective relation to `mime` is Default or Associated. Designed for
+    /// the by-mime left-pane row styling, which runs every redraw — that
+    /// frame loop reaches ~20 fps continuously to drive the cursor blink,
+    /// so this needs to be cheap even with the full SMI universe in play.
+    ///
+    /// Lookup costs:
+    ///   * Cached `mime_declarers[mime]` — typically 1–3 ids, short-circuits
+    ///     on the first non-removed entry. Covers the dominant case.
+    ///   * `assoc.added[mime]` — usually empty or tiny.
+    ///   * `pending.add[mime]` — usually empty.
+    pub fn has_any_effective_association(&self, mime: &str) -> bool {
+        if let Some(declarers) = self.mime_declarers.get(mime) {
+            for id in declarers {
+                if !self.is_effectively_removed(mime, id) {
+                    return true;
+                }
+            }
+        }
+        if let Some(added) = self.assoc.added.get(mime) {
+            for id in added {
+                // Match `effective_associations_for`'s final filter: an id
+                // referenced in `[Added Associations]` only counts if it
+                // points at an installed `.desktop`. Phantoms get rendered
+                // via the `invalid` branch, not the dim branch.
+                if !self.phantom_ids.contains(id)
+                    && !self.is_effectively_removed(mime, id)
+                {
+                    return true;
+                }
+            }
+        }
+        if let Some(added) = self.pending.add.get(mime) {
+            for id in added {
+                if !self.phantom_ids.contains(id)
+                    && !self.is_effectively_removed(mime, id)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The mime currently highlighted in the by-mime left list, if any.
@@ -1459,6 +1513,7 @@ impl App {
         assoc: OnDiskAssoc,
     ) -> Self {
         let (phantom_apps, phantom_ids) = compute_phantoms(&apps, &assoc);
+        let mime_declarers = compute_mime_declarers(&apps);
         Self {
             view: View::ByApp,
             focus: Focus::Left,
@@ -1470,6 +1525,7 @@ impl App {
             apps,
             phantom_apps,
             phantom_ids,
+            mime_declarers,
             mimes,
             assoc,
             pending: PendingEdits::default(),
@@ -1514,6 +1570,20 @@ impl App {
 /// apps, so users can't introduce a new phantom mid-session. Recompute
 /// happens on load / save / conflict-resolve reload, all of which flush
 /// pending state anyway.
+/// Build the inverse "mime → installed declarer app ids" index from `apps`.
+/// Each entry's Vec is small (typically 1–3 declarers); the work is the
+/// outer iteration over apps and mime_types. Run once at construction
+/// because `apps` is immutable for the App's lifetime.
+fn compute_mime_declarers(apps: &[DesktopApp]) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for a in apps {
+        for m in &a.mime_types {
+            out.entry(m.clone()).or_default().push(a.id.clone());
+        }
+    }
+    out
+}
+
 fn compute_phantoms(
     apps: &[DesktopApp],
     assoc: &OnDiskAssoc,

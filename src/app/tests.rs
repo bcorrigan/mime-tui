@@ -473,6 +473,64 @@ fn remove_non_default_takes_no_snapshot() {
 }
 
 #[test]
+fn has_any_effective_association_short_circuits_on_first_declarer() {
+    // The sample world has firefox + chromium both declaring text/html.
+    // The predicate must return true (declarers exist and aren't removed)
+    // — and must do so via the cached `mime_declarers`, not a full
+    // `self.apps` scan. We can't assert the path, but we can pin the
+    // observable behavior.
+    let (apps, mimes, assoc) = sample_world();
+    let app = App::for_test(apps, mimes, assoc);
+    assert!(app.has_any_effective_association("text/html"));
+    assert!(!app.has_any_effective_association("application/x-nonexistent"));
+}
+
+#[test]
+fn has_any_effective_association_honors_pending_removes() {
+    // Remove both declarers → predicate flips to false. Matches
+    // `effective_associations_for(mime).is_empty()` semantics so the dim
+    // styling stays accurate as the user edits.
+    let (apps, mimes, assoc) = sample_world();
+    let mut app = App::for_test(apps, mimes, assoc);
+    assert!(app.has_any_effective_association("text/html"));
+    app.action_remove_assoc("text/html", "firefox.desktop");
+    assert!(app.has_any_effective_association("text/html"));
+    app.action_remove_assoc("text/html", "chromium.desktop");
+    assert!(!app.has_any_effective_association("text/html"));
+}
+
+#[test]
+fn has_any_effective_association_counts_pending_adds() {
+    // No declarer for application/json in the sample world, but a pending
+    // add to firefox should flip the predicate true so the row stops
+    // looking orphaned the instant the user adds it via the picker.
+    let (apps, mimes, assoc) = sample_world();
+    let mut app = App::for_test(apps, mimes, assoc);
+    assert!(!app.has_any_effective_association("application/json"));
+    app.action_add_assoc("application/json", "firefox.desktop");
+    assert!(app.has_any_effective_association("application/json"));
+}
+
+#[test]
+fn has_any_effective_association_skips_phantom_added_entries() {
+    // An assoc.added entry pointing at an uninstalled app shouldn't
+    // count — those rows are surfaced via the `invalid` branch in the
+    // styling, not the dim branch, and `effective_associations_for`
+    // filters them out. Predicate must match.
+    let (apps, mimes, mut assoc) = sample_world();
+    let mut phantom_set = HashSet::new();
+    phantom_set.insert("phantom.desktop".to_string());
+    assoc
+        .added
+        .insert("application/json".to_string(), phantom_set);
+    let app = App::for_test(apps, mimes, assoc);
+    assert!(
+        !app.has_any_effective_association("application/json"),
+        "phantom-only mime mustn't masquerade as having a real association"
+    );
+}
+
+#[test]
 fn removing_non_default_does_not_clear_default() {
     // chromium is associated but not the default — removing it
     // mustn't touch the default for the mime.

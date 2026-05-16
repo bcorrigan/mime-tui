@@ -79,7 +79,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
             let style = if app.mime_has_missing(&mime.id) {
                 invalid_style
             } else if app.effective_default_for(&mime.id).is_none()
-                && app.effective_associations_for(&mime.id).is_empty()
+                && !app.has_any_effective_association(&mime.id)
             {
                 dim_style
             } else {
