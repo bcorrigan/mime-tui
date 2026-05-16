@@ -5,7 +5,7 @@ associations that file managers and `xdg-open` consult on linux.
 
 If you use a window manager on linux and not a full blown desktop environment like KDE, Gnome or XFCE - you still want to manage MIME type associations.
 
-Even though I mainly use terminals, I often lazily execute "open somefile.thngy" in a terminal, or attempt to open something in yazi -  and then discover that the file opens in some crazy application I would never choose, or that nothing happens at all as there is no association. Then I want to quite quickly add an association, then realise that this involves finding some desktop envirvonment GUI like XFCE's mime type manager. This is horrible for a proper hard bitted Sway user who lives in terminals.
+Even though I mainly use terminals, I often lazily execute "open somefile.thngy" in a terminal, or attempt to open something in yazi - and sometimes then discover that the file opens in some crazy application I would never choose, or that nothing happens at all as there is no association. Then I want to quite quickly add an association, then realise that this involves finding some desktop envirvonment GUI like XFCE's mime type manager. This is horrible for a proper hard-bitten Sway user who lives in terminals.
 
 So, with the recent resurgance in TUI interfaces I thought it would be very nice to have a fast and efficient TUI for managing mime type associations in a keyboard-centric way.
 
@@ -17,14 +17,14 @@ mime-tui also will surface all your broken file associations. If you are anythin
 
 Some screenshots:
 
-  <p align="center"><img src="img/bymime.png" alt="By-mime view" width="80%"/></p>
-  <p align="center"><sub>Browsing MIME types. Red are associated with uninstalled applications, grey are not associated with anything.</sub></p>
-  <p align="center"><img src="img/byapp.png" alt="By-app view" width="80%"/></p>
-  <p align="center"><sub>Editing Audacity associations - with some pending removal, and some pending being added - which will happen when Ctrl-S is pressed</sub></p>
-  <p align="center"><img src="img/appadd.png" alt="Adding associations to an application" width="80%"/></p>
-  <p align="center"><sub>Adding multiple file associations to Audacity</sub></p>
-  <p align="center"><img src="img/confirm.png" alt="Confirmation dialogue" width="80%"/></p>
-  <p align="center"><sub>COnfirmation dialogue before finally approving</sub></p>
+  <p align="center"><img src="img/bymime.png" alt="By-mime view" width="80%"/>
+  <sub>Browsing MIME types. Red are associated with uninstalled applications, grey are not associated with anything.</sub></p>
+  <p align="center"><img src="img/byapp.png" alt="By-app view" width="80%"/>
+  <sub>Editing Audacity associations - with some pending removal, and some pending being added - which will happen when Ctrl-S is pressed</sub></p>
+  <p align="center"><img src="img/appadd.png" alt="Adding associations to an application" width="80%"/>
+  <sub>Adding multiple file associations to Audacity</sub></p>
+  <p align="center"><img src="img/confirm.png" alt="Confirmation dialogue" width="80%"/>
+  <sub>Confirmation dialogue before finally approving</sub></p>
 
 ## Features
 
