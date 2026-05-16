@@ -173,6 +173,190 @@ fn clear_default_drops_entry() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Re-read the file via the public reader so tests can inspect the
+/// resulting `[Added]` / `[Removed]` sets section-aware, instead of
+/// substring-matching across the whole text.
+fn read_back(path: &Path) -> OnDiskAssoc {
+    let mut assoc = OnDiskAssoc::default();
+    let raw = fs::read_to_string(path).unwrap();
+    merge_one(&raw, path, &mut assoc);
+    assoc
+}
+
+#[test]
+fn remove_strips_matching_added_entry() {
+    // The bug: an app in [Added Associations] that the user removes should
+    // disappear from that section on save. Before the fix, it stayed and
+    // also appeared in [Removed Associations], leaving a phantom alive on
+    // the next load.
+    let dir = tempdir("mime_tui_remove_strips_added");
+    let path = dir.join("mimeapps.list");
+    fs::write(
+        &path,
+        "[Added Associations]\n\
+         x-scheme-handler/tg=userapp-Telegram.desktop;\n\
+         image/png=gimp.desktop;\n",
+    )
+    .unwrap();
+
+    let mut pending = PendingEdits::default();
+    pending.remove_assoc("x-scheme-handler/tg", "userapp-Telegram.desktop");
+
+    save_user_file_at(&path, &pending).unwrap();
+    let assoc = read_back(&path);
+
+    // The whole mime key drops from [Added] since it had only one entry.
+    assert!(assoc.added.get("x-scheme-handler/tg").is_none());
+    // Unrelated entries stay put.
+    let png = assoc.added.get("image/png").unwrap();
+    assert!(png.contains("gimp.desktop"));
+    // The remove is still recorded so any .desktop declaration is suppressed.
+    let removed = assoc.removed.get("x-scheme-handler/tg").unwrap();
+    assert!(removed.contains("userapp-Telegram.desktop"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remove_keeps_other_ids_in_added_for_same_mime() {
+    // When the same mime has multiple [Added] entries and only one is
+    // being removed, the others survive.
+    let dir = tempdir("mime_tui_remove_partial_added");
+    let path = dir.join("mimeapps.list");
+    fs::write(
+        &path,
+        "[Added Associations]\nimage/png=gimp.desktop;krita.desktop;\n",
+    )
+    .unwrap();
+
+    let mut pending = PendingEdits::default();
+    pending.remove_assoc("image/png", "gimp.desktop");
+
+    save_user_file_at(&path, &pending).unwrap();
+    let assoc = read_back(&path);
+
+    let added = assoc.added.get("image/png").unwrap();
+    assert!(added.contains("krita.desktop"));
+    assert!(!added.contains("gimp.desktop"));
+    let removed = assoc.removed.get("image/png").unwrap();
+    assert!(removed.contains("gimp.desktop"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_normalizes_added_against_removed() {
+    // Pre-existing contradictory state (the file produced by older
+    // mime-tui versions before the apply_pending strip): same (mime, id)
+    // in both [Added] and [Removed]. Load-time normalization must drop
+    // the [Added] entry so phantom-detection doesn't surface an app whose
+    // every relation has already been suppressed.
+    let dir = tempdir("mime_tui_load_normalize");
+    let path = dir.join("mimeapps.list");
+    fs::write(
+        &path,
+        "[Added Associations]\n\
+         x-scheme-handler/tg=userapp-Telegram.desktop;\n\
+         image/png=gimp.desktop;\n\
+         \n\
+         [Removed Associations]\n\
+         x-scheme-handler/tg=userapp-Telegram.desktop;\n",
+    )
+    .unwrap();
+
+    let baseline = read_user_file_baseline_at(&path);
+    let assoc = baseline.assoc;
+
+    // The contradicting entry is gone from [Added]; the unrelated one stays.
+    assert!(assoc.added.get("x-scheme-handler/tg").is_none());
+    assert!(
+        assoc
+            .added
+            .get("image/png")
+            .unwrap()
+            .contains("gimp.desktop")
+    );
+    // [Removed] is untouched — it remains the source of truth for the
+    // suppression.
+    assert!(
+        assoc
+            .removed
+            .get("x-scheme-handler/tg")
+            .unwrap()
+            .contains("userapp-Telegram.desktop")
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn save_heals_existing_contradictions_even_without_pending_for_that_mime() {
+    // The user's file has a stale (mime, id) in both [Added] and [Removed].
+    // They save an unrelated edit. The save should *also* clean up the
+    // contradiction so the file converges to a spec-consistent shape.
+    let dir = tempdir("mime_tui_save_heal");
+    let path = dir.join("mimeapps.list");
+    fs::write(
+        &path,
+        "[Added Associations]\n\
+         x-scheme-handler/tg=userapp-Telegram.desktop;\n\
+         \n\
+         [Removed Associations]\n\
+         x-scheme-handler/tg=userapp-Telegram.desktop;\n",
+    )
+    .unwrap();
+
+    // An unrelated pending edit — has nothing to say about x-scheme-handler/tg.
+    let mut pending = PendingEdits::default();
+    pending.set_default("text/html", Some("firefox.desktop"));
+
+    save_user_file_at(&path, &pending).unwrap();
+    let assoc = read_back(&path);
+
+    // The stale [Added] entry is gone.
+    assert!(assoc.added.get("x-scheme-handler/tg").is_none());
+    // The [Removed] entry stays.
+    assert!(
+        assoc
+            .removed
+            .get("x-scheme-handler/tg")
+            .unwrap()
+            .contains("userapp-Telegram.desktop")
+    );
+    // The unrelated edit went through.
+    assert_eq!(
+        assoc.defaults.get("text/html"),
+        Some(&"firefox.desktop".to_string())
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn add_strips_matching_removed_entry() {
+    // Symmetric case: re-associating an app that was previously in
+    // [Removed Associations] should lift it from there, not leave both
+    // sections contradicting each other.
+    let dir = tempdir("mime_tui_add_strips_removed");
+    let path = dir.join("mimeapps.list");
+    fs::write(
+        &path,
+        "[Removed Associations]\nimage/png=gimp.desktop;\n",
+    )
+    .unwrap();
+
+    let mut pending = PendingEdits::default();
+    pending.add_assoc("image/png", "gimp.desktop");
+
+    save_user_file_at(&path, &pending).unwrap();
+    let assoc = read_back(&path);
+
+    assert!(assoc.added.get("image/png").unwrap().contains("gimp.desktop"));
+    assert!(assoc.removed.get("image/png").is_none());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── Conflict-aware save tests ──────────────────────────────────────
 
 /// Helper: write a file, snapshot the baseline, return both.

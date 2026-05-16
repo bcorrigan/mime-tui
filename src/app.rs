@@ -210,6 +210,11 @@ pub struct App {
     /// resume. Kept as a flag rather than handled inline in `events.rs` so
     /// terminal setup/teardown stays centralised in `main.rs`.
     pub pending_suspend: bool,
+    /// True when the confirm-save modal was opened from the quit-confirmation
+    /// flow ("save & quit"). On a successful save the event handler exits the
+    /// app instead of falling back to Browse. Cleared on cancel or save error
+    /// so an unrelated future Ctrl-S doesn't inherit the quit intent.
+    pub quit_after_save: bool,
     pub config: MimeTuiConfig,
     fuzzy_matcher: SkimMatcherV2,
 }
@@ -256,6 +261,7 @@ impl App {
             active_preset: None,
             flash: None,
             pending_suspend: false,
+            quit_after_save: false,
             config,
             fuzzy_matcher: SkimMatcherV2::default(),
         })
@@ -511,6 +517,12 @@ impl App {
 
     /// Set `app_id` as the default for `mime`.
     pub fn action_set_default(&mut self, mime: &str, app_id: &str) {
+        // The user's explicit default choice supersedes any cascade-restore
+        // snapshot we'd captured during a prior `r`. Drop snapshots for this
+        // mime so a later `undo_remove` doesn't fight their intent.
+        self.pending
+            .remove_default_snapshot
+            .retain(|(m, _), _| m != mime);
         self.pending.set_default(mime, Some(app_id));
         // Setting the default implies the app is associated; if the user had
         // pending-removed it, drop that.
@@ -535,6 +547,11 @@ impl App {
 
     /// Clear the default for `mime`.
     pub fn action_clear_default(&mut self, mime: &str) {
+        // Same rationale as `action_set_default`: the user's explicit clear
+        // supersedes any cascade snapshot.
+        self.pending
+            .remove_default_snapshot
+            .retain(|(m, _), _| m != mime);
         self.pending.set_default(mime, None);
     }
 
@@ -574,6 +591,16 @@ impl App {
             return false;
         }
 
+        // Capture the prior `pending.set_default[mime]` value so `undo_remove`
+        // can restore it if the user toggles this `r` off. Without this, an
+        // `r`-then-`r` round-trip silently loses the user's prior default
+        // intent (the on-disk default if no pending entry existed, or the
+        // pending `d` they'd already issued).
+        let prior_default = self.pending.set_default.get(mime).cloned();
+        self.pending
+            .remove_default_snapshot
+            .insert((mime.to_string(), app_id.to_string()), prior_default);
+
         // Cascade: drop any pending default change targeting this app,
         // and if the on-disk default also pointed here, explicitly clear
         // it so the save doesn't preserve the dangling line.
@@ -591,7 +618,10 @@ impl App {
             .map(|s| s == app_id)
             .unwrap_or(false);
         if on_disk_default_was_app && !self.pending.set_default.contains_key(mime) {
-            self.pending.set_default(mime, None);
+            // Direct insert (not via `pending.set_default(...)`) because this
+            // is the cascade itself, not a user-explicit clear — we don't
+            // want the snapshot we just captured to be invalidated.
+            self.pending.set_default.insert(mime.to_string(), None);
         }
         true
     }
@@ -728,8 +758,27 @@ impl App {
         // Default check — same precedence as `effective_default_for`, but the
         // `is_effectively_removed` filter (which honours pending.remove) is
         // intentionally skipped.
-        let default = if let Some(slot) = self.pending.set_default.get(mime) {
-            slot.as_deref()
+        //
+        // Subtlety: when this row is itself pending-removed AND was the
+        // default, `action_remove_assoc` cascades and sets
+        // `pending.set_default[mime] = None`. Reading that None back here
+        // would flip the row out of the Default bucket — exactly the
+        // reordering we're trying to avoid. So when the row is
+        // pending-removed, fall through to the on-disk default instead.
+        // The cascade still takes effect on save; this only affects how
+        // the row is grouped in the displayable list.
+        let pending_removed = self
+            .pending
+            .remove
+            .get(mime)
+            .map(|s| s.contains(app_id))
+            .unwrap_or(false);
+        let default = if !pending_removed {
+            if let Some(slot) = self.pending.set_default.get(mime) {
+                slot.as_deref()
+            } else {
+                self.assoc.defaults.get(mime).map(String::as_str)
+            }
         } else {
             self.assoc.defaults.get(mime).map(String::as_str)
         };
@@ -1179,9 +1228,12 @@ impl App {
         self.mode = Mode::ConfirmSave;
     }
 
-    /// Leave the confirm-save modal back to Browse without saving.
+    /// Leave the confirm-save modal back to Browse without saving. Also
+    /// abandons any pending "save & quit" intent — cancelling the review
+    /// means the user is no longer mid-quit.
     pub fn close_confirm_save(&mut self) {
         self.mode = Mode::Browse;
+        self.quit_after_save = false;
     }
 
     /// Build a per-mime summary of every pending edit, suitable for direct
@@ -1444,6 +1496,7 @@ impl App {
             active_preset: None,
             flash: None,
             pending_suspend: false,
+            quit_after_save: false,
             config: MimeTuiConfig::default(),
             fuzzy_matcher: SkimMatcherV2::default(),
         }

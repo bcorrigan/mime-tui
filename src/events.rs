@@ -432,28 +432,86 @@ fn action_remove(app: &mut App) {
             "{} restored — no longer pending removal from {}",
             app_name, mime_id
         ));
-    } else {
-        let cleared_default = app.action_remove_assoc(&mime_id, &app_id);
-        let msg = if cleared_default {
-            format!(
-                "{} removed from {} (also cleared as default)",
-                app_name, mime_id
-            )
-        } else {
-            format!("{} is no longer associated with {}", app_name, mime_id)
-        };
-        app.set_flash(msg);
+        // Undo branch: user is correcting, not progressing through a list.
+        // Keep the cursor on the row they just restored. Still clamp in
+        // case some other state has shifted the list bounds.
+        let new_count = right_pane_count(app);
+        if new_count == 0 {
+            app.focus = Focus::Left;
+            app.selected_right = 0;
+        } else if app.selected_right >= new_count {
+            app.selected_right = new_count - 1;
+        }
+        return;
     }
 
-    // Keep right-pane selection in bounds. The displayable count is stable
-    // across an r-toggle (removed rows stay visible), so in practice this
-    // only fires when the displayable list is genuinely empty.
+    // Capture the row's stable identifier *before* the mutation so we can
+    // find its new index in the post-mutation list and advance the cursor
+    // past it. In by-app the row is keyed by mime id; in by-mime by app id.
+    let anchor = match app.view {
+        View::ByApp => mime_id.clone(),
+        View::ByMime => app_id.clone(),
+    };
+
+    let cleared_default = app.action_remove_assoc(&mime_id, &app_id);
+    let msg = if cleared_default {
+        format!(
+            "{} removed from {} (also cleared as default)",
+            app_name, mime_id
+        )
+    } else {
+        format!("{} is no longer associated with {}", app_name, mime_id)
+    };
+    app.set_flash(msg);
+
     let new_count = right_pane_count(app);
     if new_count == 0 {
         app.focus = Focus::Left;
         app.selected_right = 0;
-    } else if app.selected_right >= new_count {
-        app.selected_right = new_count - 1;
+        return;
+    }
+
+    match find_right_row_index(app, &anchor) {
+        Some(idx) => {
+            // Row still visible (strikethrough remove). Advance past it so
+            // repeated `r`s walk down the list.
+            app.selected_right = (idx + 1).min(new_count - 1);
+        }
+        None => {
+            // Row vanished — the pending-add cancel path. The row that was
+            // below has shifted up into this slot, so the current
+            // `selected_right` already points there; just clamp.
+            app.selected_right = app.selected_right.min(new_count - 1);
+        }
+    }
+}
+
+/// Locate `anchor` in the current right-pane list and return its index, or
+/// `None` if it's no longer present. View-aware: in by-app the anchor is a
+/// mime id (rows keyed by mime); in by-mime it's an app id (rows keyed by
+/// app, with phantom missing-assoc rows appended after the installed list).
+fn find_right_row_index(app: &App, anchor: &str) -> Option<usize> {
+    match app.view {
+        View::ByApp => {
+            let selected = app.currently_selected_app()?;
+            let list = app.displayable_mime_list_for_app(&selected.id);
+            list.iter().position(|(m, _, _)| m.id == anchor)
+        }
+        View::ByMime => {
+            let selected = app.currently_selected_mime()?;
+            let mime_id = selected.id.clone();
+            let assoc = app.displayable_associations_for(&mime_id);
+            if let Some(i) = assoc.iter().position(|(a, _)| a.id == anchor) {
+                return Some(i);
+            }
+            // Phantoms occupy the tail of the right list — same coordinate
+            // system as `target_pair`'s by-mime branch.
+            let missing = app.missing_associations_for(&mime_id);
+            missing
+                .iter()
+                .position(|m| m.app_id == anchor)
+                .map(|i| i + assoc.len())
+        }
     }
 }
 
@@ -477,8 +535,22 @@ fn handle_key_confirm_save(app: &mut App, key: KeyEvent) -> bool {
         (KeyCode::Enter, _)
         | (KeyCode::Char('y'), _)
         | (KeyCode::Char('Y'), _) => {
-            app.close_confirm_save();
+            // Don't go through close_confirm_save here: it would clear
+            // quit_after_save before we've decided whether to honour it.
+            let should_quit = app.quit_after_save;
+            app.mode = Mode::Browse;
             do_save(app);
+            // Clean save → we're back in Browse with nothing pending. If the
+            // user got here via "save & quit", exit. Otherwise drop the
+            // intent so a future Ctrl-S doesn't surprise-quit.
+            // A conflict reroutes to Mode::ConflictResolve; keep the flag
+            // alive so the eventual resolution can quit too.
+            if matches!(app.mode, Mode::Browse) && !app.is_dirty() && should_quit {
+                return true;
+            }
+            if !matches!(app.mode, Mode::ConflictResolve { .. }) {
+                app.quit_after_save = false;
+            }
         }
         // Cancel — back to Browse with pending edits intact.
         (KeyCode::Esc, _)
@@ -745,18 +817,26 @@ fn handle_key_conflict_resolve(
             // Reload: discard pending, take the on-disk state as gospel.
             app.reload_from_disk();
             app.mode = Mode::Browse;
+            // Reload means the user stepped out of the "save & quit" flow:
+            // they're now exploring on-disk state, not exiting.
+            app.quit_after_save = false;
             app.set_flash("Discarded pending edits; reloaded from disk.");
             false
         }
         KeyCode::Char('o') | KeyCode::Char('O') => {
             // Overwrite: clobber external changes.
+            let should_quit = app.quit_after_save;
             match app.save_force() {
                 Ok((n, _shadowed)) => {
                     app.mode = Mode::Browse;
+                    app.quit_after_save = false;
                     app.set_flash(format!(
                         "Force-saved {} edit(s); external changes were overwritten.",
                         n
                     ));
+                    if should_quit {
+                        return true;
+                    }
                 }
                 Err(e) => app.set_flash(format!("Force save failed: {}", e)),
             }
@@ -765,15 +845,20 @@ fn handle_key_conflict_resolve(
         KeyCode::Char('m') | KeyCode::Char('M') => {
             // Merge: drop the conflicting pending edits, save the rest.
             let dropped = conflicts.len();
+            let should_quit = app.quit_after_save;
             match app.save_dropping_conflicts(conflicts) {
                 Ok(SaveResult::Saved { written, .. }) => {
                     app.mode = Mode::Browse;
+                    app.quit_after_save = false;
                     app.set_flash(format!(
                         "Saved {} edit(s); dropped {} conflicting one{}.",
                         written,
                         dropped,
                         if dropped == 1 { "" } else { "s" },
                     ));
+                    if should_quit {
+                        return true;
+                    }
                 }
                 Ok(SaveResult::Conflicts(remaining)) => {
                     // Shouldn't happen — drop_conflicting_edits cleared them
@@ -785,8 +870,10 @@ fn handle_key_conflict_resolve(
             false
         }
         KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
-            // Cancel: keep pending in memory, dismiss the modal.
+            // Cancel: keep pending in memory, dismiss the modal. Backing out
+            // of conflict resolution also abandons the quit intent.
             app.mode = Mode::Browse;
+            app.quit_after_save = false;
             false
         }
         _ => false,
@@ -860,8 +947,12 @@ fn handle_key_confirm_quit(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Char('s') | KeyCode::Char('S') => {
-            do_save(app);
-            !app.is_dirty() // only quit if save succeeded
+            // Route through the same review modal Ctrl-S uses. The flag tells
+            // the confirm-save handler to exit on a clean save instead of
+            // returning to Browse.
+            app.quit_after_save = true;
+            app.open_confirm_save();
+            false
         }
         _ => {
             // Anything else cancels and returns to Browse.

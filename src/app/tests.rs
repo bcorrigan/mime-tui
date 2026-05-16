@@ -1,4 +1,5 @@
 use super::*;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn sample_world() -> (Vec<DesktopApp>, Vec<MimeType>, OnDiskAssoc) {
     let apps = vec![
@@ -202,15 +203,273 @@ fn removing_the_default_cascades_to_clear_it() {
         .expect("default change should be staged");
     assert!(slot.is_none(), "expected Some(None), got {:?}", slot);
 
-    // The displayable view drops the ★ on the strikethrough row —
-    // it's no longer the default after this remove takes effect.
+    // The displayable view *keeps* the ★ on the strikethrough row so it
+    // stays in the Default bucket — otherwise the row would jump from the
+    // top of the list into Associated, which is disorienting and breaks
+    // "repeated `r` walks down the list". The cascade still applies on
+    // save (`pending.set_default` is Some(None)); this only affects
+    // display grouping until commit.
     let displayable = app.displayable_mime_list_for_app("firefox.desktop");
     let row = displayable
         .iter()
         .find(|(m, _, _)| m.id == "text/html")
         .expect("firefox should still appear in displayable list");
     assert!(row.2, "pending-removed flag should be true");
-    assert_eq!(row.1, Relation::Associated);
+    assert_eq!(row.1, Relation::Default);
+}
+
+#[test]
+fn removing_default_keeps_row_in_default_bucket_for_display() {
+    // Two-mime regression test for the ordering fix: when the cursor sits
+    // on a Default row and the user presses `r`, the row must stay in the
+    // Default bucket (top of the list) rather than dropping into
+    // Associated. Otherwise it visually jumps down and breaks "tap `r` to
+    // walk down the list".
+    let (apps, mut mimes, mut assoc) = sample_world();
+    // Add a second mime so we can verify *position*, not just relation.
+    mimes.push(MimeType {
+        id: "text/plain".into(),
+        description: "Plain text".into(),
+    });
+    // firefox is default for *both* mimes. text/html is alphabetically
+    // first, so it should be at index 0, text/plain at index 1.
+    assoc
+        .defaults
+        .insert("text/html".into(), "firefox.desktop".into());
+    assoc
+        .defaults
+        .insert("text/plain".into(), "firefox.desktop".into());
+    // Make firefox handle both mimes so it shows up at all.
+    let mut apps = apps;
+    apps[0].mime_types.push("text/plain".into());
+    let mut app = App::for_test(apps, mimes, assoc);
+
+    let before = app.displayable_mime_list_for_app("firefox.desktop");
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].0.id, "text/html");
+    assert_eq!(before[0].1, Relation::Default);
+    assert_eq!(before[1].0.id, "text/plain");
+    assert_eq!(before[1].1, Relation::Default);
+
+    // Remove firefox from text/html (the top row).
+    app.action_remove_assoc("text/html", "firefox.desktop");
+
+    let after = app.displayable_mime_list_for_app("firefox.desktop");
+    assert_eq!(after.len(), 2, "row stays visible with strikethrough");
+    // Critical: text/html is still at index 0 and still in the Default
+    // bucket. Without the fix it would have dropped to Associated and
+    // moved below text/plain.
+    assert_eq!(after[0].0.id, "text/html");
+    assert_eq!(after[0].1, Relation::Default);
+    assert!(after[0].2, "pending-removed flag should be set");
+    assert_eq!(after[1].0.id, "text/plain");
+    assert_eq!(after[1].1, Relation::Default);
+}
+
+#[test]
+fn repeated_r_walks_cursor_down_in_by_app_view() {
+    // End-to-end: with the cursor on row 0 of the by-app right pane,
+    // pressing `r` should mark the row removed AND advance the cursor to
+    // row 1, so a second `r` removes the next row. Without the cursor
+    // bump, the second `r` would un-remove row 0 (the toggle).
+    let (mut apps, mut mimes, mut assoc) = sample_world();
+    // Extend the world so firefox handles three mimes — gives us room to
+    // verify the cursor walks through them.
+    mimes.push(MimeType {
+        id: "text/plain".into(),
+        description: "Plain text".into(),
+    });
+    mimes.push(MimeType {
+        id: "text/xml".into(),
+        description: "XML".into(),
+    });
+    apps[0].mime_types = vec![
+        "text/html".into(),
+        "text/plain".into(),
+        "text/xml".into(),
+    ];
+    assoc
+        .defaults
+        .insert("text/html".into(), "firefox.desktop".into());
+    let mut app = App::for_test(apps, mimes, assoc);
+    app.view = View::ByApp;
+    app.focus = Focus::Right;
+    app.selected_left = 0; // firefox
+    app.selected_right = 0; // text/html (Default bucket, alphabetically first)
+
+    let r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+
+    // First r: removes text/html, cursor advances to row 1 (text/plain).
+    crate::events::handle_key(&mut app, r).unwrap();
+    assert_eq!(app.selected_right, 1);
+    assert!(app.is_pending_removed_row("text/html", "firefox.desktop"));
+    assert!(!app.is_pending_removed_row("text/plain", "firefox.desktop"));
+
+    // Second r: removes text/plain, cursor advances to row 2 (text/xml).
+    crate::events::handle_key(&mut app, r).unwrap();
+    assert_eq!(app.selected_right, 2);
+    assert!(app.is_pending_removed_row("text/plain", "firefox.desktop"));
+
+    // Third r: removes text/xml, cursor clamps at row 2 (last row).
+    crate::events::handle_key(&mut app, r).unwrap();
+    assert_eq!(app.selected_right, 2);
+    assert!(app.is_pending_removed_row("text/xml", "firefox.desktop"));
+}
+
+#[test]
+fn r_on_already_removed_row_undoes_and_stays_put() {
+    // The undo branch must NOT advance the cursor — the user is
+    // correcting their last action, not progressing through the list.
+    let (apps, mimes, assoc) = sample_world();
+    let mut app = App::for_test(apps, mimes, assoc);
+    app.view = View::ByApp;
+    app.focus = Focus::Right;
+    app.selected_left = 0; // firefox
+    app.selected_right = 0;
+
+    let r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+
+    // First r: removes text/html, cursor would advance — but there's only
+    // one row, so it clamps back to 0.
+    crate::events::handle_key(&mut app, r).unwrap();
+    assert!(app.is_pending_removed_row("text/html", "firefox.desktop"));
+    assert_eq!(app.selected_right, 0);
+
+    // Reset to row 0 explicitly (in case the one-row world is masking
+    // movement) and undo.
+    app.selected_right = 0;
+    crate::events::handle_key(&mut app, r).unwrap();
+    assert!(!app.is_pending_removed_row("text/html", "firefox.desktop"));
+    assert_eq!(app.selected_right, 0, "undo must not advance the cursor");
+}
+
+#[test]
+fn undo_remove_restores_on_disk_default() {
+    // The original fix-3 scenario. firefox is on-disk default for text/html.
+    // `r` cascades and stages `set_default[mime] = None`. `r` again toggles
+    // the remove off — and must also drop the cascade'd clear, otherwise
+    // the user would silently lose the default on save despite "undoing"
+    // their remove.
+    let (apps, mimes, mut assoc) = sample_world();
+    assoc
+        .defaults
+        .insert("text/html".into(), "firefox.desktop".into());
+    let mut app = App::for_test(apps, mimes, assoc);
+
+    app.action_remove_assoc("text/html", "firefox.desktop");
+    assert_eq!(
+        app.pending.set_default.get("text/html"),
+        Some(&None),
+        "cascade should stage a clear",
+    );
+
+    app.action_undo_remove("text/html", "firefox.desktop");
+    assert!(
+        !app.pending.set_default.contains_key("text/html"),
+        "undo must drop the cascade'd clear so the on-disk default stands",
+    );
+    assert_eq!(
+        app.effective_default_for("text/html").map(|a| a.id.as_str()),
+        Some("firefox.desktop"),
+        "on-disk default should be effective again after undo",
+    );
+}
+
+#[test]
+fn undo_remove_restores_pending_default_when_d_preceded_r() {
+    // chromium is on-disk default; firefox is not. User pending-sets
+    // firefox via `d`, then removes firefox via `r`, then undoes. The
+    // restored state should bring back the pending `d` (firefox), not
+    // silently leave chromium effective.
+    let (apps, mimes, mut assoc) = sample_world();
+    assoc
+        .defaults
+        .insert("text/html".into(), "chromium.desktop".into());
+    let mut app = App::for_test(apps, mimes, assoc);
+
+    app.action_set_default("text/html", "firefox.desktop");
+    assert_eq!(
+        app.pending.set_default.get("text/html"),
+        Some(&Some("firefox.desktop".to_string())),
+    );
+
+    app.action_remove_assoc("text/html", "firefox.desktop");
+    assert!(
+        !app.pending.set_default.contains_key("text/html"),
+        "cascade should have dropped the pending default-change entry",
+    );
+
+    app.action_undo_remove("text/html", "firefox.desktop");
+    assert_eq!(
+        app.pending.set_default.get("text/html"),
+        Some(&Some("firefox.desktop".to_string())),
+        "undo should restore the user's prior `d` intent",
+    );
+}
+
+#[test]
+fn explicit_clear_after_remove_supersedes_snapshot() {
+    // r firefox (default) → c (explicit clear) → r undo. The explicit
+    // clear should win — the undo must not restore the on-disk default,
+    // because the user has separately and explicitly cleared it.
+    let (apps, mimes, mut assoc) = sample_world();
+    assoc
+        .defaults
+        .insert("text/html".into(), "firefox.desktop".into());
+    let mut app = App::for_test(apps, mimes, assoc);
+
+    app.action_remove_assoc("text/html", "firefox.desktop");
+    app.action_clear_default("text/html");
+    assert_eq!(app.pending.set_default.get("text/html"), Some(&None));
+
+    app.action_undo_remove("text/html", "firefox.desktop");
+    assert_eq!(
+        app.pending.set_default.get("text/html"),
+        Some(&None),
+        "user's explicit clear must outlive the undo-remove restore",
+    );
+}
+
+#[test]
+fn explicit_d_after_remove_supersedes_snapshot() {
+    // r firefox (default) → d chromium → r undo. The user's `d` is the
+    // active intent; undo must not roll it back to firefox.
+    let (apps, mimes, mut assoc) = sample_world();
+    assoc
+        .defaults
+        .insert("text/html".into(), "firefox.desktop".into());
+    let mut app = App::for_test(apps, mimes, assoc);
+
+    app.action_remove_assoc("text/html", "firefox.desktop");
+    app.action_set_default("text/html", "chromium.desktop");
+    app.action_undo_remove("text/html", "firefox.desktop");
+
+    assert_eq!(
+        app.pending.set_default.get("text/html"),
+        Some(&Some("chromium.desktop".to_string())),
+        "the later `d` chromium wins",
+    );
+}
+
+#[test]
+fn remove_non_default_takes_no_snapshot() {
+    // Sanity check: removing a non-default row must not stash a snapshot,
+    // otherwise an unrelated `c` followed by undo would inadvertently
+    // restore a default that the user never had.
+    let (apps, mimes, mut assoc) = sample_world();
+    assoc
+        .defaults
+        .insert("text/html".into(), "firefox.desktop".into());
+    let mut app = App::for_test(apps, mimes, assoc);
+
+    app.action_remove_assoc("text/html", "chromium.desktop");
+    assert!(
+        app.pending
+            .remove_default_snapshot
+            .get(&("text/html".to_string(), "chromium.desktop".to_string()))
+            .is_none(),
+        "non-default remove shouldn't capture a snapshot",
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! of files into a single [`OnDiskAssoc`] for display, and write back **only**
 //! to the user's `$XDG_CONFIG_HOME/mimeapps.list` — never to system files.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -124,7 +124,24 @@ pub fn read_all() -> OnDiskAssoc {
         };
         merge_one(&content, &path, &mut assoc);
     }
+    normalize_added_against_removed(&mut assoc);
     assoc
+}
+
+/// Strip any `(mime, id)` from `assoc.added` that's also in `assoc.removed`.
+/// Per the XDG spec, a [Removed Associations] entry overrides any matching
+/// [Added Associations] entry — keeping both in memory does nothing except
+/// mislead `compute_phantoms` into surfacing apps whose every relation has
+/// already been suppressed. Pre-existing contradictions in the user's file
+/// (e.g. from mime-tui versions before the apply_pending fix) are healed
+/// here so the UI behaves like the spec says it should.
+fn normalize_added_against_removed(assoc: &mut OnDiskAssoc) {
+    for (mime, removed_ids) in &assoc.removed {
+        if let Some(added_ids) = assoc.added.get_mut(mime) {
+            added_ids.retain(|id| !removed_ids.contains(id));
+        }
+    }
+    assoc.added.retain(|_, v| !v.is_empty());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +347,25 @@ fn parse_user_file(content: &str) -> UserFile {
     UserFile { sections }
 }
 
+/// Remove every (mime, id) listed in `pairs` from `map`, dropping mime keys
+/// whose value list goes empty. Used by `apply_pending` to keep the
+/// `[Added]` / `[Removed]` sections from contradicting each other after a
+/// remove cancels an earlier add (or vice versa).
+fn strip_pending(
+    map: &mut BTreeMap<String, Vec<String>>,
+    pairs: &HashMap<String, HashSet<String>>,
+) {
+    for (mime, ids) in pairs {
+        let Some(entry) = map.get_mut(mime) else {
+            continue;
+        };
+        entry.retain(|existing| !ids.contains(existing));
+        if entry.is_empty() {
+            map.remove(mime);
+        }
+    }
+}
+
 fn apply_pending(file: &mut UserFile, pending: &PendingEdits) {
     let mut have_default = false;
     let mut have_added = false;
@@ -359,6 +395,11 @@ fn apply_pending(file: &mut UserFile, pending: &PendingEdits) {
                         }
                     }
                 }
+                // A pending remove must strip the matching entry from
+                // [Added Associations] — otherwise re-loading mimeapps.list
+                // still surfaces the (now unwanted) app via assoc.added,
+                // including as a phantom in the by-app list.
+                strip_pending(map, &pending.remove);
             }
             SectionEntry::Removed(map) => {
                 have_removed = true;
@@ -370,6 +411,10 @@ fn apply_pending(file: &mut UserFile, pending: &PendingEdits) {
                         }
                     }
                 }
+                // Symmetric: a pending add must lift any matching
+                // [Removed Associations] entry so the two sections don't
+                // contradict each other after the round-trip.
+                strip_pending(map, &pending.add);
             }
             SectionEntry::Unknown { .. } => {}
         }
@@ -403,6 +448,37 @@ fn apply_pending(file: &mut UserFile, pending: &PendingEdits) {
             map.insert(mime.clone(), v);
         }
         file.sections.push(SectionEntry::Removed(map));
+    }
+
+    heal_added_against_removed(file);
+}
+
+/// Final pass over the parsed file: drop any `(mime, id)` from
+/// `[Added Associations]` that also appears in `[Removed Associations]`.
+/// Pending-driven cases (add cancels remove, remove cancels add) are
+/// handled earlier by [`strip_pending`]; this pass exists to clean up
+/// pre-existing contradictions left in the file by earlier mime-tui
+/// versions or by hand-edits. Any save then writes the spec-consistent
+/// form even if the user's pending edits don't touch the offending mime.
+fn heal_added_against_removed(file: &mut UserFile) {
+    let mut removed_pairs: HashMap<String, HashSet<String>> = HashMap::new();
+    for s in file.sections.iter() {
+        if let SectionEntry::Removed(map) = s {
+            for (mime, ids) in map {
+                let entry = removed_pairs.entry(mime.clone()).or_default();
+                for id in ids {
+                    entry.insert(id.clone());
+                }
+            }
+        }
+    }
+    if removed_pairs.is_empty() {
+        return;
+    }
+    for s in file.sections.iter_mut() {
+        if let SectionEntry::Added(map) = s {
+            strip_pending(map, &removed_pairs);
+        }
     }
 }
 
@@ -552,6 +628,7 @@ pub fn read_user_file_baseline_at(path: &Path) -> UserFileBaseline {
     let raw = fs::read_to_string(path).unwrap_or_default();
     let mut assoc = OnDiskAssoc::default();
     merge_one(&raw, path, &mut assoc);
+    normalize_added_against_removed(&mut assoc);
     UserFileBaseline { assoc, raw }
 }
 
@@ -582,6 +659,7 @@ pub fn save_user_file_safely_at(
     // line added (no semantic conflict). Re-parse and check per-mime.
     let mut current = OnDiskAssoc::default();
     merge_one(&current_raw, path, &mut current);
+    normalize_added_against_removed(&mut current);
 
     let conflicts = detect_conflicts(&baseline.assoc, &current, pending);
     if !conflicts.is_empty() {
@@ -703,6 +781,12 @@ pub fn drop_conflicting_edits(pending: &mut PendingEdits, conflicts: &[MimeConfl
         match &c.kind {
             ConflictKind::DefaultChanged { .. } => {
                 pending.set_default.remove(&c.mime);
+                // The dropped default change is the very thing the cascade
+                // snapshot would restore on undo; without it, the snapshot
+                // is orphaned. Drop snapshots for this mime to match.
+                pending
+                    .remove_default_snapshot
+                    .retain(|(m, _), _| m != &c.mime);
             }
             ConflictKind::AddRemoveOpposed { app_id, we_added } => {
                 if *we_added {
@@ -717,6 +801,11 @@ pub fn drop_conflicting_edits(pending: &mut PendingEdits, conflicts: &[MimeConfl
                     if set.is_empty() {
                         pending.remove.remove(&c.mime);
                     }
+                    // The matching remove just got dropped — its snapshot
+                    // would never fire again. Drop it too.
+                    pending
+                        .remove_default_snapshot
+                        .remove(&(c.mime.clone(), app_id.clone()));
                 }
             }
         }

@@ -75,6 +75,24 @@ pub struct PendingEdits {
     pub set_default: HashMap<String, Option<String>>,
     pub add: HashMap<String, HashSet<String>>,
     pub remove: HashMap<String, HashSet<String>>,
+    /// For each `(mime, app_id)` pair currently in `remove`, a snapshot of
+    /// what `set_default[mime]` looked like *before* `App::action_remove_assoc`
+    /// ran its default-clearing cascade. `undo_remove` restores from here so
+    /// the user's prior default intent (whether on-disk or pending) isn't
+    /// silently lost when they undo a remove.
+    ///
+    /// Inner value:
+    ///   * `None`           — `set_default[mime]` had no entry; restore by
+    ///                        dropping the cascade's `Some(None)` insert.
+    ///   * `Some(None)`     — `set_default[mime]` was `Some(None)` (pending
+    ///                        explicit clear); restore that.
+    ///   * `Some(Some(x))`  — `set_default[mime]` was `Some(Some(x))` (the
+    ///                        user had pending-set an app as default); restore.
+    ///
+    /// Cleared by [`PendingEdits::clear`] and invalidated for a given mime
+    /// when the user takes any explicit default action on that mime (their
+    /// intent supersedes the cascade).
+    pub remove_default_snapshot: HashMap<(String, String), Option<Option<String>>>,
 }
 
 impl PendingEdits {
@@ -86,6 +104,7 @@ impl PendingEdits {
         self.set_default.clear();
         self.add.clear();
         self.remove.clear();
+        self.remove_default_snapshot.clear();
     }
 
     pub fn count(&self) -> usize {
@@ -129,11 +148,28 @@ impl PendingEdits {
     /// by the `r`-toggle: pressing `r` on a pending-removed row should bring
     /// the row back to its on-disk state, *not* coerce it into pending.add
     /// (which is what `add_assoc` would do).
+    ///
+    /// Also restores any `set_default[mime]` value that was clobbered by the
+    /// matching `action_remove_assoc` cascade — see
+    /// [`remove_default_snapshot`](Self::remove_default_snapshot).
     pub fn undo_remove(&mut self, mime: &str, id: &str) {
         if let Some(s) = self.remove.get_mut(mime) {
             s.remove(id);
             if s.is_empty() {
                 self.remove.remove(mime);
+            }
+        }
+        if let Some(prior) = self
+            .remove_default_snapshot
+            .remove(&(mime.to_string(), id.to_string()))
+        {
+            match prior {
+                Some(v) => {
+                    self.set_default.insert(mime.to_string(), v);
+                }
+                None => {
+                    self.set_default.remove(mime);
+                }
             }
         }
     }
