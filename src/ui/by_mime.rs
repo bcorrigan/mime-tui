@@ -57,13 +57,20 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
             .collect()
     };
 
-    // Style each row: a mime whose default / added / pending assocs reach
-    // a non-installed `.desktop` gets the `invalid` colour + bold, so the
-    // user can scan the list and immediately see which mimes have stale
-    // entries to clean up.
+    // Row styling, in priority order:
+    //   1. `invalid` (red + bold) — at least one association points at a
+    //      `.desktop` that isn't installed; the user has stale entries to
+    //      clean up.
+    //   2. `secondary` (dim) — the mime is in the universe (declared by
+    //      shared-mime-info or referenced somewhere), but has no effective
+    //      default *and* no effective associations. These are the
+    //      "orphan" mimes the wider universe surfaces — visually de-
+    //      emphasised so the eye flows past them when scanning.
+    //   3. Default — at least one healthy installed association.
     let invalid_style = Style::default()
         .fg(Theme::parse_color(&config.colors.invalid))
         .add_modifier(Modifier::BOLD);
+    let dim_style = Style::default().fg(Theme::parse_color(&config.colors.secondary));
     let items: Vec<Line<'static>> = scrolled
         .iter()
         .enumerate()
@@ -71,6 +78,10 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
             let mime = &visible[i];
             let style = if app.mime_has_missing(&mime.id) {
                 invalid_style
+            } else if app.effective_default_for(&mime.id).is_none()
+                && app.effective_associations_for(&mime.id).is_empty()
+            {
+                dim_style
             } else {
                 Style::default()
             };

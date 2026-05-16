@@ -1573,6 +1573,12 @@ fn load_world() -> Result<(Vec<DesktopApp>, Vec<MimeType>, OnDiskAssoc)> {
     for k in assoc.defaults.keys().chain(assoc.added.keys()).chain(assoc.removed.keys()) {
         universe.insert(k.clone());
     }
+    // Pull in the full shared-mime-info universe so mimes with no installed
+    // declarer and no mimeapps.list anchor are still discoverable — the user
+    // can land on `text/x-rust` on a Rust-toolchain-less box and associate
+    // an editor with `a`. Falls back to a no-op on systems where no
+    // `<datadir>/mime/types` file exists.
+    universe.extend(storage::mime_info::enumerate_all_mime_ids());
 
     let mime_ids: Vec<String> = universe.into_iter().collect();
     storage::mime_info::refresh_descriptions(&mut storage.conn, &mime_ids)?;
