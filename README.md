@@ -3,18 +3,28 @@
 A keyboard-driven terminal UI for managing the MIME-type->application
 associations that file managers and `xdg-open` consult on linux. 
 
-If you use a window manager on linux and not a full blown desktop environment like KDE, Gnome or XFCE - you still want to manage MIME type associations. Lots of people achieve this by using the XFCE mime type manager which is mostly-independent of the rest of XFCE, but with the recent resurgance in TUI interfaces I thought it would be very nice to have a fast and efficient TUI for managing mime type associations in a keyboard-centric way.
+If you use a window manager on linux and not a full blown desktop environment like KDE, Gnome or XFCE - you still want to manage MIME type associations.
+
+Even though I mainly use terminals, I often lazily execute "open somefile.thngy" in a terminal, or attempt to open something in yazi -  and then discover that the file opens in some crazy application I would never choose, or that nothing happens at all as there is no association. Then I want to quite quickly add an association, then realise that this involves finding some desktop envirvonment GUI like XFCE's mime type manager. This is horrible for a proper hard bitted Sway user who lives in terminals.
+
+So, with the recent resurgance in TUI interfaces I thought it would be very nice to have a fast and efficient TUI for managing mime type associations in a keyboard-centric way.
 
 As you probably don't intend to use a mime editor every day, it is focussed on being easy to use and well prompted with keyboard help. You should be able to launch it to edit something once or twice every 6 months - and be able to use it easily.
 
 mime-tui only updates `~/.config/mimeapps.list` - so it may not interact well with Gnome and KDE where they have "override" files where they preferentially look for mime associations over and above the mimeapps.list. mime-tui is probably best suited for users of Sway, Hyprland, and so on as a result.
 
+mime-tui also will surface all your broken file associations. If you are anything like me you may have a long history of chaos on your desktop, things being added and removed over the years and different desktop envs tried out. This can lead to a lot of file associations to no-longer installed applications! mime-tui will make this obvious and allow for easy and quick fixing.
 
-<p align="center">
-  <img src="bymime.png" alt="By-mime view" width="49%"/>
-  <img src="byapp.png" alt="The multi-toggle picker, open from the by-app view" width="49%"/>
-</p>
+Some screenshots:
 
+  <img src="img/bymime.png" alt="By-mime view" width="80%"/>
+  <p align="center"><sub>Browsing MIME types. Red are associated with uninstalled applications, grey are not associated with anything.</sub></p>
+  <img src="img/byapp.png" alt="By-app view" width="80%"/>
+  <p align="center"><sub>Editing Audacity associations - with some pending removal, and some pending being added - which will happen when Ctrl-S is pressed</sub></p>
+  <img src="img/appadd.png" alt="Adding associations to an application" width="80%"/>
+  <p align="center"><sub>Adding multiple file associations to Audacity</sub></p>
+  <img src="img/confirm.png" alt="Confirmation dialogue" width="80%"/>
+  <p align="center"><sub>COnfirmation dialogue before finally approving</sub></p>
 <p align="center">
   <sub><b>Left:</b> browsing MIME types, filtered to <code>text</code> — the right pane shows the resolved default and full associations list for the selected type. &nbsp;
   <b>Right:</b> the by-app view with the multi-toggle picker open over it</sub>
@@ -22,22 +32,14 @@ mime-tui only updates `~/.config/mimeapps.list` - so it may not interact well wi
 
 ## Features
 
-- **Two browse modes.** `Tab` between "by MIME type" (which apps handle
-  this?) and "by application" (which mimes does this app handle?).
-- **Live fuzzy search.** Type to filter the left list. Prefix matches
-  rank above fuzzy hits.
-- **Inline edits with live preview.** `d` set default, `r` remove, `c`
-  clear default, `a` open picker. Edits accumulate in memory and the UI
-  reflects them immediately; an explicit `Ctrl-S` writes them out.
-- **Multi-toggle picker.** `Space` / `Enter` flips the highlighted row on
-  or off and stays open so you can rapidly toggle many entries. Each row
-  shows its current relationship (`★` default, `✓` associated, `·`
-  declared-only, blank if unrelated). `Ctrl-Space` sets an emacs-style
-  mark for range operations; the whole marked range then toggles
-  uniformly.
-- **Atomic save.** Writes a tempfile then renames, with a rolling `.bak`.
+- **Two browse modes.** Bang `Tab` to switch between "by app" (which apps handle
+  this?) and "by mime" (which mimes does this app handle?).
+- **Live fuzzy search.** There's 800 mime types on my system and quite a few apps.
+- **Inline edits with live preview.** Edits accumulate in memory and the UI
+  reflects them immediately - highlighting added and removed items - then hitting `Ctrl-S` takes you to a final review screen for you to check before writing out.
+- **Atomic save.** I'm a bit paranoid about my code destroying people's file associations and mildly irritating them. So mime-tui writes a tempfile then renames, and has a rolling `.bak` file.
   After a successful save, runs `update-desktop-database` best-effort so
-  other apps see your edit without a logout/login.
+  other apps see your edit without a logout/login. And, before save we check if anything else has modified associations (maybe mime-tui was left open for 5 days in a terminal window and applications were added and removed? Got to be paranoid) - and if they have we merge the changes in, and if there's a conflict mime-tui refuses to action it.
 - **XDG-correct read.** Walks the full priority chain - per-desktop
   overrides (`gnome-mimeapps.list`, etc.), `$XDG_CONFIG_DIRS`, and the
   deprecated locations under `$XDG_DATA_DIRS` - and resolves them per
@@ -52,9 +54,15 @@ mime-tui only updates `~/.config/mimeapps.list` - so it may not interact well wi
   SQLite; subsequent runs do mtime-only checks and start in milliseconds.
 - **Themable.** Colors, borders, cursor shape, etc. via an optional
   TOML config. Every field falls back to a built-in default.
-- **Mouse supported.** Click to select, scroll-wheel to navigate.
+- **Mouse supported.** Click to select, scroll-wheel to navigate - I think almost the whole UI is mouseable, despite being a terminal app.
 
 ## Install
+
+On arch/cachyOS - install **mime-tui** from the AUR.
+
+You probably want to install a nerd font like `ttf-firacode-nerd` - for icons, line drawing characters etc.
+
+Manually - you should install rust toolchain first (get rustup) then:
 
 ```bash
 git clone https://github.com/yourname/mime-tui
@@ -69,26 +77,9 @@ Then run it:
 mime-tui
 ```
 
-## Keybindings
-
-Press **`?`** at any time for the full reference. The most useful ones:
-
-| Key                          | What it does                                              |
-| ---------------------------- | --------------------------------------------------------- |
-| `Tab`                        | switch between by-mime / by-app views                     |
-| arrows, `PgUp` / `PgDn`      | navigate (emacs `C-n` / `C-p` / `C-v` / `M-v` also work)  |
-| typing                       | fuzzy-filter the left list                                |
-| `→`                          | move focus to the right pane (enter edit mode)            |
-| `d` / `r` / `c`              | *(right pane)* set default / remove / clear default       |
-| `a`                          | *(right pane)* open picker to add associations            |
-| `Space` / `Enter`            | *(in picker)* toggle the row at the cursor                |
-| `Ctrl-Space`                 | *(in picker)* set / clear mark for range selection        |
-| `Ctrl-S`                     | save pending edits                                        |
-| `Ctrl-Z`                     | discard all pending edits                                 |
-| `Esc`                        | quit (confirms if unsaved); also dismisses overlays       |
-| `?`                          | show keybindings overlay                                  |
-
 ## Configuration
+
+There really isn't much config except related to theming where I tried to make it a bit flexible, I know terminal and TUI users have all kinds of wacky colour schemes so mime-tui tries to be flexible.
 
 `mime-tui` looks for `~/.config/mime-tui/mime-tui.toml`. Every field is
 optional. The simplest config picks a preset:
