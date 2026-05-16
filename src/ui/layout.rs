@@ -8,9 +8,54 @@ use ratatui::{
     },
     style::Style,
 };
+use crossterm::event::KeyEvent;
 use tui_input::Input;
 use crate::app::Focus;
 use crate::config::{MimeTuiConfig, Theme, SearchPosition};
+
+/// A single atom in a modal hint bar. `spans` are rendered into the
+/// line; when `action` is Some, the chunk is also registered as a
+/// clickable region whose click synthesises that key event.
+pub struct HintChunk {
+    pub spans: Vec<Span<'static>>,
+    pub action: Option<KeyEvent>,
+}
+
+impl HintChunk {
+    pub fn width(&self) -> usize {
+        self.spans.iter().map(|s| s.width()).sum()
+    }
+}
+
+/// Render `chunks` left-to-right as a single line at the top of `area`
+/// and append a `(rect, key_event)` entry to `sink` for each clickable
+/// chunk. Used by modal hint bars so their buttons are mouse-actionable
+/// via the same status-click dispatcher the bottom bar uses.
+pub fn render_hint_line(
+    f: &mut Frame,
+    area: Rect,
+    chunks: Vec<HintChunk>,
+    text_style: Style,
+    sink: &mut Vec<(Rect, KeyEvent)>,
+) {
+    let mut all_spans: Vec<Span<'static>> = Vec::new();
+    let mut col: u16 = 0;
+    for chunk in chunks {
+        let w = chunk.width() as u16;
+        if let Some(action) = chunk.action {
+            sink.push((
+                Rect::new(area.x.saturating_add(col), area.y, w, 1),
+                action,
+            ));
+        }
+        all_spans.extend(chunk.spans);
+        col = col.saturating_add(w);
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(all_spans)).style(text_style),
+        area,
+    );
+}
 
 /// Base text style for the current theme. Apply to Block.style /
 /// Paragraph.style / List.style so plain (`Span::raw`) text picks up the

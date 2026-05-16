@@ -95,8 +95,11 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
     app.left_rect = Some(left_area);
 
     let selected_mime = visible.get(clamped_left).cloned();
+    // `app.right_rect` is set inside `render_associations` to the list's
+    // sub-rect (i.e. excluding the summary block at the top). Mouse
+    // clicks hit-test against this rect, so it must match what the user
+    // actually sees as "the clickable list".
     draw_right(f, app, right_area, selected_mime.as_ref(), config);
-    app.right_rect = Some(right_area);
 }
 
 fn draw_right(
@@ -182,7 +185,8 @@ fn render_summary(
                         invalid,
                     )));
                     lines.push(Line::from(Span::styled(
-                        "  (app not installed)".to_string(),
+                        "  (not installed — press `r` below to remove)"
+                            .to_string(),
                         invalid,
                     )));
                 }
@@ -207,6 +211,11 @@ fn render_associations(
     app: &mut App,
     config: &MimeTuiConfig,
 ) {
+    // Stash the list rect for mouse hit-testing. This is the bottom
+    // sub-rect of the right column — excluding the summary Paragraph
+    // above — which is what the user reads as the clickable list.
+    app.right_rect = Some(area);
+
     let Some(m) = mime else {
         layout::render_list(
             f,
@@ -302,7 +311,10 @@ fn render_associations(
         if missing.is_default {
             spans.push(Span::styled("  (default)".to_string(), row_style));
         }
-        spans.push(Span::styled("  (app not installed)".to_string(), row_style));
+        spans.push(Span::styled(
+            "  (not installed — press `r` to remove)".to_string(),
+            row_style,
+        ));
         items.push(Line::from(spans));
     }
 

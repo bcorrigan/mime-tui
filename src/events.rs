@@ -125,6 +125,16 @@ fn handle_key_browse(app: &mut App, key: KeyEvent) -> Result<bool> {
             (KeyCode::Char('a'), Focus::Right, View::ByApp) => {
                 if let Some(a) = app.currently_selected_app() {
                     let app_id = a.id.clone();
+                    if app.is_phantom_app(&app_id) {
+                        // Adding mime associations to a non-installed
+                        // app would just plant fresh orphan entries —
+                        // the opposite of cleanup.
+                        app.set_flash(format!(
+                            "Can't add associations — {} is not installed",
+                            app_id
+                        ));
+                        return Ok(false);
+                    }
                     app.open_pick_mime(app_id);
                 }
                 return Ok(false);
@@ -209,10 +219,16 @@ fn handle_key_browse(app: &mut App, key: KeyEvent) -> Result<bool> {
             }
             return Ok(false);
         }
-        KeyCode::Right => {
-            // Always allow focusing the right pane — even when empty — so the
-            // user has a reliable way to reach 'a' (add/picker) on items that
-            // currently have no associations.
+        KeyCode::Right | KeyCode::Enter => {
+            // Right-arrow is the canonical "enter the right pane" key; we
+            // also accept Enter because it's the natural reflex for "drill
+            // in / accept", and the search input is live (Enter would do
+            // nothing useful if forwarded there). On the right pane this
+            // arm becomes a no-op — no Enter-bound action defined there.
+            //
+            // Always allow focusing the right pane — even when empty — so
+            // the user has a reliable way to reach 'a' (add/picker) on
+            // items that currently have no associations.
             if app.focus != Focus::Right {
                 app.focus = Focus::Right;
                 let count = right_pane_count(app);
@@ -385,6 +401,16 @@ fn action_set_default(app: &mut App) {
     let Some((mime_id, app_id, app_name)) = target_pair(app) else {
         return;
     };
+    if app.is_phantom_app(&app_id) {
+        // Setting a non-installed app as default would just plant a
+        // fresh orphan `[Default Applications]` entry — the very kind
+        // of garbage we surface as red and offer to clean up.
+        app.set_flash(format!(
+            "Can't set default — {} is not installed",
+            app_id
+        ));
+        return;
+    }
     app.action_set_default(&mime_id, &app_id);
     app.set_flash(format!(
         "{} is now the default app for {}",
@@ -898,6 +924,21 @@ fn forward_to_input(input: &mut tui_input::Input, key: KeyEvent) {
 const WHEEL_STEP: usize = 3;
 
 pub fn handle_mouse(app: &mut App, ev: MouseEvent) -> Result<bool> {
+    // Status-bar clicks fire the represented keybinding before mode-specific
+    // dispatch — each hint chunk carries the KeyEvent it stands for, so
+    // clicking it is equivalent to typing that key. Wraps and re-uses every
+    // existing key-dispatch path; no per-mode click logic needed.
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        let hit = app
+            .status_clickables
+            .iter()
+            .find(|(rect, _)| rect_contains(*rect, ev.column, ev.row))
+            .map(|(_, key)| *key);
+        if let Some(key) = hit {
+            return handle_key(app, key);
+        }
+    }
+
     match app.mode.clone() {
         Mode::Browse => handle_mouse_browse(app, ev),
         Mode::PickApp { .. } | Mode::PickMime { .. } => handle_mouse_picker(app, ev),
@@ -906,7 +947,9 @@ pub fn handle_mouse(app: &mut App, ev: MouseEvent) -> Result<bool> {
             Ok(handle_mouse_theme_pick(app, ev, selected))
         }
         Mode::ConfirmSave => Ok(handle_mouse_confirm_save(app, ev)),
-        // These modals are small and decision-focused — keyboard-only.
+        // These modals are small and decision-focused — keyboard-only
+        // for the body, but their status-bar hints (above) are still
+        // clickable via the dispatcher prelude.
         Mode::ConfirmQuit | Mode::ConflictResolve { .. } => Ok(false),
     }
 }
@@ -934,6 +977,20 @@ fn handle_mouse_confirm_save(app: &mut App, ev: MouseEvent) -> bool {
 fn handle_mouse_theme_pick(app: &mut App, ev: MouseEvent, selected: usize) -> bool {
     let count = crate::config::PRESET_NAMES.len();
     match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Click on a list row → preview that preset directly. The
+            // theme list lives inside the modal's already-bordered inner
+            // area (no per-list border), so we map row directly to index
+            // without `click_row_in_list`'s 1-cell border offset.
+            if let Some(rect) = app.theme_list_rect {
+                if rect_contains(rect, ev.column, ev.row) {
+                    let target = (ev.row - rect.y) as usize;
+                    if target < count {
+                        app.preview_theme(target);
+                    }
+                }
+            }
+        }
         MouseEventKind::ScrollUp => {
             if selected > 0 {
                 app.preview_theme(selected - 1);

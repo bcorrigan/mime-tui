@@ -1,14 +1,17 @@
 use crate::app::App;
 use crate::config::{MimeTuiConfig, Theme, PRESET_NAMES};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState},
 };
 
-pub fn draw(f: &mut Frame, app: &App, selected: usize, config: &MimeTuiConfig) {
+use crate::ui::layout::{HintChunk, render_hint_line};
+
+pub fn draw(f: &mut Frame, app: &mut App, selected: usize, config: &MimeTuiConfig) {
     // Compact modal — small enough that the rest of the app remains
     // visible underneath, so the user can see the current view repainted
     // with whichever theme is being previewed.
@@ -64,17 +67,28 @@ pub fn draw(f: &mut Frame, app: &App, selected: usize, config: &MimeTuiConfig) {
     let mut state = ListState::default();
     state.select(Some(selected));
     f.render_stateful_widget(list, chunks[0], &mut state);
+    // Stash the list rect so the mouse handler can click-select a row.
+    app.theme_list_rect = Some(chunks[0]);
 
-    let hint = Line::from(vec![
-        Span::raw(" "),
-        Span::styled("↑↓", key),
-        Span::styled(":preview  ", dim),
-        Span::styled("Enter", key),
-        Span::styled(":keep  ", dim),
-        Span::styled("Esc", key),
-        Span::styled(":cancel", dim),
-    ]);
-    f.render_widget(Paragraph::new(hint).style(text), chunks[1]);
+    // Hint bar — each clickable atom dispatches its key via the status
+    // click prelude. ↑↓:preview maps to Down (= "next theme") since the
+    // two arrows don't pick one direction.
+    let hint_chunks = vec![
+        HintChunk { spans: vec![Span::raw(" ")], action: None },
+        HintChunk {
+            spans: vec![Span::styled("↑↓", key), Span::styled(":preview  ", dim)],
+            action: Some(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        },
+        HintChunk {
+            spans: vec![Span::styled("Enter", key), Span::styled(":keep  ", dim)],
+            action: Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        },
+        HintChunk {
+            spans: vec![Span::styled("Esc", key), Span::styled(":cancel", dim)],
+            action: Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        },
+    ];
+    render_hint_line(f, chunks[1], hint_chunks, text, &mut app.status_clickables);
 }
 
 fn centered_rect(area: Rect, percent_x: u16, fixed_height: u16) -> Rect {

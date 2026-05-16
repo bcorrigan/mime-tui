@@ -10,6 +10,7 @@
 use crate::app::{App, ChangeSummary, DefaultChange};
 use crate::config::{MimeTuiConfig, Theme};
 use crate::ui::layout;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -98,20 +99,45 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
         config,
     );
 
-    // Footer hint — single line, same styling as picker modal's bottom row.
+    // Footer hint — each atom is clickable via the status-click prelude.
     let key = Style::default()
         .fg(Theme::parse_color(&config.colors.focus))
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Theme::parse_color(&config.colors.secondary));
-    let footer = Line::from(vec![
-        Span::styled(" Enter / y", key),
-        Span::styled(": save  ", dim),
-        Span::styled("Esc / n", key),
-        Span::styled(": cancel  ", dim),
-        Span::styled("↑↓ PgUp PgDn", key),
-        Span::styled(": scroll", dim),
-    ]);
-    f.render_widget(Paragraph::new(footer).style(text), footer_area);
+    let footer_chunks = vec![
+        layout::HintChunk {
+            spans: vec![Span::raw(" ")],
+            action: None,
+        },
+        layout::HintChunk {
+            spans: vec![
+                Span::styled("Enter / y", key),
+                Span::styled(": save  ", dim),
+            ],
+            action: Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        },
+        layout::HintChunk {
+            spans: vec![
+                Span::styled("Esc / n", key),
+                Span::styled(": cancel  ", dim),
+            ],
+            action: Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        },
+        layout::HintChunk {
+            spans: vec![
+                Span::styled("↑↓ PgUp PgDn", key),
+                Span::styled(": scroll", dim),
+            ],
+            action: Some(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        },
+    ];
+    layout::render_hint_line(
+        f,
+        footer_area,
+        footer_chunks,
+        text,
+        &mut app.status_clickables,
+    );
 }
 
 fn build_lines(

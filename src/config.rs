@@ -191,7 +191,11 @@ const DEFAULT_LIGHT: Palette = Palette {
     focus: "#1976d2",            // navy-blue, modern flat feel
     unfocused: "#cccccc",
     highlight: "#fbc02d",        // amber (legible on white)
-    text: "#212121",             // near-black for white bgs
+    // Empty (like DEFAULT_DARK) — both "default" presets defer to the
+    // terminal's own foreground colour. The opinionated palettes below
+    // (gruvbox, dracula, nord, …) explicitly override it; the "default"
+    // pair is meant to adapt to whatever the user has set up.
+    text: "",
     secondary: "#666666",
     selection_fg: "#000000",
     scrollbar_thumb: "",

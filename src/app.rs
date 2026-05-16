@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
+use crossterm::event::KeyEvent;
+
 use eyre::Result;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -127,6 +129,15 @@ pub struct App {
     pub cursor_visible: bool,
     pub cursor_last_toggle: Instant,
     pub apps: Vec<DesktopApp>,
+    /// Synthesised `DesktopApp` records for app ids that are referenced
+    /// in mimeapps.list (or pending edits) but whose `.desktop` files
+    /// aren't installed. Lives alongside `apps` rather than inside it so
+    /// every "is this app installed?" check stays correct — phantoms are
+    /// for *display* only.
+    pub phantom_apps: Vec<DesktopApp>,
+    /// Fast membership lookup over `phantom_apps`. Kept in sync via
+    /// `recompute_phantoms`.
+    pub phantom_ids: HashSet<String>,
     pub mimes: Vec<MimeType>,
     pub assoc: OnDiskAssoc,
     /// Snapshot of the user's `mimeapps.list` at startup. Conflict detection
@@ -174,6 +185,15 @@ pub struct App {
     pub help_scroll: u16,
     /// Vertical scroll offset for the confirm-save modal. Reset to 0 each
     /// time the modal opens so the user starts at the top.
+    /// Clickable regions in the bottom status bar. Each entry pairs a
+    /// rect (in absolute screen coords) with the key event that chunk
+    /// represents — the mouse handler synthesises that key on click so
+    /// every existing key-dispatch path is re-used for free. Repopulated
+    /// every frame by `status::draw`.
+    pub status_clickables: Vec<(Rect, KeyEvent)>,
+    /// Theme-picker list rect, set each frame by `theme_pick::draw`. Lets
+    /// the mouse handler click-select a preset row to preview it.
+    pub theme_list_rect: Option<Rect>,
     pub confirm_save_vscroll: u16,
     /// Horizontal scroll offset for the confirm-save modal. Long mime ids
     /// can overflow the modal width; Shift+←/→ moves this.
@@ -198,14 +218,17 @@ impl App {
     pub fn new(config: MimeTuiConfig) -> Result<Self> {
         let (apps, mimes, assoc) = load_world()?;
         let user_baseline = storage::mimeapps::read_user_file_baseline();
+        let (phantom_apps, phantom_ids) = compute_phantoms(&apps, &assoc);
         Ok(Self {
-            view: View::ByMime,
+            view: View::ByApp,
             focus: Focus::Left,
             mode: Mode::Browse,
             input: Input::default(),
             cursor_visible: true,
             cursor_last_toggle: Instant::now(),
             apps,
+            phantom_apps,
+            phantom_ids,
             mimes,
             assoc,
             user_baseline,
@@ -226,6 +249,8 @@ impl App {
             pick_list_state: ListState::default(),
             pick_list_rect: None,
             help_scroll: 0,
+            status_clickables: Vec::new(),
+            theme_list_rect: None,
             confirm_save_vscroll: 0,
             confirm_save_hscroll: 0,
             active_preset: None,
@@ -297,10 +322,41 @@ impl App {
 
     pub fn visible_apps(&self) -> Vec<&DesktopApp> {
         let q = self.query();
+        // Phantoms participate in the by-app left pane so the user can
+        // navigate to an uninstalled app and clean up its dangling assocs,
+        // but the picker (`apps_matching`) deliberately excludes them —
+        // there's no point offering a phantom as a *new* association.
+        //
+        // Surface phantoms at the *top* of the list: they're the
+        // actionable / cleanup items, and dropping them at the bottom of
+        // a list of hundreds of installed apps buries them.
         if q.is_empty() {
-            return self.apps.iter().collect();
+            return self
+                .phantom_apps
+                .iter()
+                .chain(self.apps.iter())
+                .collect();
         }
-        self.apps_matching(&q)
+        let q = q.trim();
+        let mut scored: Vec<(&DesktopApp, i64)> = self
+            .phantom_apps
+            .iter()
+            .chain(self.apps.iter())
+            .filter_map(|a| {
+                let by_name = self.score(&a.name, q);
+                let by_id = self.score(&a.id, q);
+                let best = match (by_name, by_id) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                best.map(|s| (a, s))
+            })
+            .collect();
+        // Stable sort by score (desc). With equal scores the original
+        // chain order wins → phantoms above installed apps for ties.
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().map(|(a, _)| a).collect()
     }
 
     /// Generic "search apps by query". Used by both the main app list and the
@@ -407,6 +463,39 @@ impl App {
     pub fn currently_selected_mime(&self) -> Option<&MimeType> {
         let visible = self.visible_mimes();
         visible.get(self.selected_left).copied()
+    }
+
+    /// The app id that row-level operations (`d`, `r`, `c`'s flash
+    /// label, etc.) currently target. In by-app it's the left selection;
+    /// in by-mime it's the right-pane row (which may be installed or a
+    /// phantom). Used by the status bar and the action handlers to
+    /// decide which affordances are valid in the current selection.
+    pub fn current_target_app_id(&self) -> Option<String> {
+        match self.view {
+            View::ByApp => self.currently_selected_app().map(|a| a.id.clone()),
+            View::ByMime => {
+                let mime = self.currently_selected_mime()?;
+                let mime_id = mime.id.clone();
+                let assoc = self.displayable_associations_for(&mime_id);
+                if let Some((entry, _)) = assoc.get(self.selected_right) {
+                    return Some(entry.id.clone());
+                }
+                // Past the installed portion — must be in the phantom tail.
+                let missing = self.missing_associations_for(&mime_id);
+                let off = self.selected_right.checked_sub(assoc.len())?;
+                missing.get(off).map(|m| m.app_id.clone())
+            }
+        }
+    }
+
+    /// True iff `current_target_app_id` resolves to a phantom. The status
+    /// bar and action handlers use this to suppress / refuse the `d` and
+    /// `a` (in by-app) affordances on uninstalled targets — those would
+    /// leave behind exactly the kind of orphan entries we surface as red.
+    pub fn current_target_is_phantom(&self) -> bool {
+        self.current_target_app_id()
+            .map(|id| self.is_phantom_app(&id))
+            .unwrap_or(false)
     }
 
     pub fn currently_selected_app(&self) -> Option<&DesktopApp> {
@@ -976,12 +1065,33 @@ impl App {
         self.pending.clear();
         self.assoc = storage::mimeapps::read_all();
         self.user_baseline = storage::mimeapps::read_user_file_baseline();
+        self.recompute_phantoms();
     }
 
     fn finalise_save(&mut self) {
         self.pending.clear();
         self.assoc = storage::mimeapps::read_all();
         self.user_baseline = storage::mimeapps::read_user_file_baseline();
+        self.recompute_phantoms();
+    }
+
+    /// Re-derive `phantom_apps` / `phantom_ids` from the current on-disk
+    /// state. Called after any reload (startup, save, conflict-resolve
+    /// reload) so the phantom set stays in lock-step with what's actually
+    /// in mimeapps.list. Pending edits don't shift the set in practice —
+    /// the picker only offers installed apps — so we don't recompute on
+    /// every action.
+    fn recompute_phantoms(&mut self) {
+        let (phantom_apps, phantom_ids) = compute_phantoms(&self.apps, &self.assoc);
+        self.phantom_apps = phantom_apps;
+        self.phantom_ids = phantom_ids;
+    }
+
+    /// True if `id` is a synthesised phantom (referenced in mimeapps.list
+    /// but the matching `.desktop` isn't installed). Drives the red row
+    /// tint in the by-app left pane.
+    pub fn is_phantom_app(&self, id: &str) -> bool {
+        self.phantom_ids.contains(id)
     }
 
     fn compute_shadowed(&self, pending_defaults: &[String]) -> Vec<String> {
@@ -1296,8 +1406,9 @@ impl App {
         mimes: Vec<MimeType>,
         assoc: OnDiskAssoc,
     ) -> Self {
+        let (phantom_apps, phantom_ids) = compute_phantoms(&apps, &assoc);
         Self {
-            view: View::ByMime,
+            view: View::ByApp,
             focus: Focus::Left,
             mode: Mode::Browse,
             input: Input::default(),
@@ -1305,6 +1416,8 @@ impl App {
             cursor_last_toggle: Instant::now(),
             user_baseline: UserFileBaseline::default(),
             apps,
+            phantom_apps,
+            phantom_ids,
             mimes,
             assoc,
             pending: PendingEdits::default(),
@@ -1324,6 +1437,8 @@ impl App {
             pick_list_state: ListState::default(),
             pick_list_rect: None,
             help_scroll: 0,
+            status_clickables: Vec::new(),
+            theme_list_rect: None,
             confirm_save_vscroll: 0,
             confirm_save_hscroll: 0,
             active_preset: None,
@@ -1333,6 +1448,56 @@ impl App {
             fuzzy_matcher: SkimMatcherV2::default(),
         }
     }
+}
+
+/// Walk on-disk associations and surface app ids that aren't backed by
+/// any installed `.desktop` file. Each phantom gets a minimal synthesised
+/// record so the by-app left pane can render it alongside real apps:
+/// `name` is the id itself (we have no `.desktop` Name= to pull from)
+/// and `comment` carries the "(application not installed)" tag that the
+/// detail pane will surface.
+///
+/// `pending.*` is *not* consulted here — the picker only offers installed
+/// apps, so users can't introduce a new phantom mid-session. Recompute
+/// happens on load / save / conflict-resolve reload, all of which flush
+/// pending state anyway.
+fn compute_phantoms(
+    apps: &[DesktopApp],
+    assoc: &OnDiskAssoc,
+) -> (Vec<DesktopApp>, HashSet<String>) {
+    use std::collections::BTreeSet;
+    let installed: HashSet<&str> = apps.iter().map(|a| a.id.as_str()).collect();
+    let mut phantoms: BTreeSet<String> = BTreeSet::new();
+    for id in assoc.defaults.values() {
+        if !installed.contains(id.as_str()) {
+            phantoms.insert(id.clone());
+        }
+    }
+    for set in assoc.added.values() {
+        for id in set {
+            if !installed.contains(id.as_str()) {
+                phantoms.insert(id.clone());
+            }
+        }
+    }
+
+    let phantom_ids: HashSet<String> = phantoms.iter().cloned().collect();
+    let phantom_apps: Vec<DesktopApp> = phantoms
+        .into_iter()
+        .map(|id| DesktopApp {
+            id: id.clone(),
+            // No real `.desktop` to read Name= from — display the id.
+            name: id,
+            comment: "Application not installed — the mime associations \
+                      listed below can be removed with `r`."
+                .into(),
+            exec: String::new(),
+            terminal: false,
+            mime_types: Vec::new(),
+            category: String::new(),
+        })
+        .collect();
+    (phantom_apps, phantom_ids)
 }
 
 /// Build the full world: parse `.desktop` files, read mimeapps.list, resolve
@@ -1720,6 +1885,126 @@ mod tests {
         app.action_remove_assoc("text/html", "chromium.desktop");
         assert!(app.is_pending_removed_row("text/html", "chromium.desktop"));
         assert_eq!(app.pending.count(), 1);
+    }
+
+    #[test]
+    fn current_target_is_phantom_in_by_app_when_phantom_selected() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "org.gnome.Loupe.desktop".into());
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        // visible_apps order: phantoms first, then installed.
+        let visible: Vec<String> =
+            app.visible_apps().iter().map(|a| a.id.clone()).collect();
+        let loupe_idx = visible
+            .iter()
+            .position(|id| id == "org.gnome.Loupe.desktop")
+            .expect("phantom should appear in visible_apps");
+
+        app.view = View::ByApp;
+        app.selected_left = loupe_idx;
+        assert!(
+            app.current_target_is_phantom(),
+            "by-app + phantom highlighted → target is phantom"
+        );
+
+        // Pick an installed app instead → not phantom.
+        let firefox_idx = visible
+            .iter()
+            .position(|id| id == "firefox.desktop")
+            .expect("firefox should be in visible_apps");
+        app.selected_left = firefox_idx;
+        assert!(!app.current_target_is_phantom());
+    }
+
+    #[test]
+    fn current_target_is_phantom_in_by_mime_when_right_row_is_phantom() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "org.gnome.Loupe.desktop".into());
+        let mut mimes = mimes;
+        mimes.push(MimeType {
+            id: "image/png".into(),
+            description: "PNG image".into(),
+        });
+        let mut app = App::for_test(apps, mimes, assoc);
+
+        app.view = View::ByMime;
+        // Position the left pane on image/png.
+        let vis: Vec<String> =
+            app.visible_mimes().iter().map(|m| m.id.clone()).collect();
+        let png_idx = vis.iter().position(|id| id == "image/png").unwrap();
+        app.selected_left = png_idx;
+
+        // displayable_associations_for image/png includes 0 installed
+        // apps (neither firefox nor chromium declares image/png) plus
+        // the phantom Loupe. So selected_right=0 → the phantom row.
+        let displayable = app.displayable_associations_for("image/png");
+        let installed_count = displayable.len();
+        app.selected_right = installed_count; // first phantom row
+        assert!(app.current_target_is_phantom());
+    }
+
+    #[test]
+    fn phantom_apps_synthesised_from_uninstalled_default() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "org.gnome.Loupe.desktop".into());
+        let app = App::for_test(apps, mimes, assoc);
+
+        assert!(app.is_phantom_app("org.gnome.Loupe.desktop"));
+        assert!(!app.is_phantom_app("firefox.desktop"));
+        // Phantom is materialised as a DesktopApp with id=name and a
+        // (not installed) comment so the right-pane summary lands clean.
+        let phantom = app
+            .phantom_apps
+            .iter()
+            .find(|a| a.id == "org.gnome.Loupe.desktop")
+            .expect("phantom record should be synthesised");
+        assert_eq!(phantom.name, "org.gnome.Loupe.desktop");
+        assert!(phantom.comment.contains("not installed"));
+    }
+
+    #[test]
+    fn visible_apps_lists_phantoms_before_installed() {
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "org.gnome.Loupe.desktop".into());
+        let app = App::for_test(apps, mimes, assoc);
+
+        let visible = app.visible_apps();
+        // The two installed apps (firefox, chromium) plus the phantom Loupe.
+        assert_eq!(visible.len(), 3);
+        // Phantoms are surfaced first — they're the cleanup items the
+        // user is most likely looking for in this view.
+        assert_eq!(visible[0].id, "org.gnome.Loupe.desktop");
+        let installed_ids: Vec<&str> =
+            visible[1..].iter().map(|a| a.id.as_str()).collect();
+        assert!(installed_ids.contains(&"firefox.desktop"));
+        assert!(installed_ids.contains(&"chromium.desktop"));
+    }
+
+    #[test]
+    fn picker_apps_matching_excludes_phantoms() {
+        // The picker offers apps for new associations — phantoms must
+        // not show up there since associating a non-installed app makes
+        // no sense.
+        let (apps, mimes, mut assoc) = sample_world();
+        assoc
+            .defaults
+            .insert("image/png".into(), "org.gnome.Loupe.desktop".into());
+        let app = App::for_test(apps, mimes, assoc);
+
+        let picker = app.apps_matching("loupe");
+        assert!(
+            picker.iter().all(|a| a.id != "org.gnome.Loupe.desktop"),
+            "phantom Loupe leaked into the picker results"
+        );
     }
 
     #[test]

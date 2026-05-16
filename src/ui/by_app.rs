@@ -48,14 +48,35 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
             .collect()
     };
 
-    let clamped_left = app.selected_left.min(scrolled.len().saturating_sub(1));
+    // Style each row: phantom apps (referenced by mimeapps.list but
+    // whose `.desktop` isn't installed) get the `invalid` colour + bold
+    // so the user can scan the list and spot which uninstalled apps
+    // still have dangling associations to clean up.
+    let invalid_style = Style::default()
+        .fg(Theme::parse_color(&config.colors.invalid))
+        .add_modifier(Modifier::BOLD);
+    let items: Vec<Line<'static>> = scrolled
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let row_app = &visible[i];
+            let style = if app.is_phantom_app(&row_app.id) {
+                invalid_style
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(s.clone(), style))
+        })
+        .collect();
+
+    let clamped_left = app.selected_left.min(items.len().saturating_sub(1));
     let focus_left = app.focus == Focus::Left;
 
-    layout::render_list(
+    layout::render_list_lines(
         f,
         left_area,
         " Applications ",
-        &scrolled,
+        &items,
         Some(clamped_left),
         focus_left,
         config,
@@ -65,8 +86,11 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, config: &MimeTuiConfig) {
     app.left_rect = Some(left_area);
 
     let selected_app = visible.get(clamped_left).cloned();
+    // `app.right_rect` is set inside `render_mimes_list` to the list's
+    // sub-rect (excluding the summary block above). Mouse clicks
+    // hit-test against this rect, so it must match what the user
+    // actually sees as "the clickable list".
     draw_right(f, app, right_area, selected_app.as_ref(), config);
-    app.right_rect = Some(right_area);
 }
 
 fn draw_right(
@@ -131,6 +155,10 @@ fn render_mimes_list(
     app: &mut App,
     config: &MimeTuiConfig,
 ) {
+    // Stash the list rect for mouse hit-testing — list-only, excluding
+    // the summary Paragraph above.
+    app.right_rect = Some(area);
+
     let Some(a) = selected else {
         layout::render_list(
             f,

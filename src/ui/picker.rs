@@ -1,12 +1,13 @@
 use crate::app::{App, Focus, Mode, Relation};
 use crate::config::{MimeTuiConfig, Theme};
 use crate::ui::layout;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear},
 };
 use tui_input::Input;
 
@@ -122,31 +123,39 @@ pub fn draw(f: &mut Frame, app: &mut App, config: &MimeTuiConfig) {
         config,
     );
 
+    // Modal-internal hint bar — each labelled action is also a click
+    // target, dispatched through the status-click prelude as a
+    // synthesised keypress.
     let mark_active = app.pick_mark.is_some();
-    let hint = if mark_active {
-        Line::from(vec![
-            Span::styled(" Space", key),
-            Span::styled(": toggle range  ", dim),
-            Span::styled("Enter", key),
-            Span::styled(": accept  ", dim),
-            Span::styled("Ctrl-Space", key),
-            Span::styled(": clear mark  ", dim),
-            Span::styled("Esc", key),
-            Span::styled(": close", dim),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(" Space", key),
-            Span::styled(": toggle  ", dim),
-            Span::styled("Enter", key),
-            Span::styled(": accept  ", dim),
-            Span::styled("Ctrl-Space", key),
-            Span::styled(": set mark  ", dim),
-            Span::styled("Esc", key),
-            Span::styled(": close", dim),
-        ])
-    };
-    f.render_widget(Paragraph::new(hint).style(text), chunks[2]);
+    let space_label = if mark_active { ": toggle range  " } else { ": toggle  " };
+    let ctrl_space_label =
+        if mark_active { ": clear mark  " } else { ": set mark  " };
+    let hint_chunks = vec![
+        layout::HintChunk {
+            spans: vec![Span::raw(" ")],
+            action: None,
+        },
+        layout::HintChunk {
+            spans: vec![Span::styled("Space", key), Span::styled(space_label, dim)],
+            action: Some(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        },
+        layout::HintChunk {
+            spans: vec![Span::styled("Enter", key), Span::styled(": accept  ", dim)],
+            action: Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        },
+        layout::HintChunk {
+            spans: vec![
+                Span::styled("Ctrl-Space", key),
+                Span::styled(ctrl_space_label, dim),
+            ],
+            action: Some(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+        },
+        layout::HintChunk {
+            spans: vec![Span::styled("Esc", key), Span::styled(": close", dim)],
+            action: Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        },
+    ];
+    layout::render_hint_line(f, chunks[2], hint_chunks, text, &mut app.status_clickables);
 }
 
 /// Build a single picker row as a Line with four logical parts:
