@@ -17,13 +17,13 @@ mime-tui also will surface all your broken file associations. If you are anythin
 
 Some screenshots:
 
-  <p align="center"><img src="img/bymime.png" alt="By-mime view" width="80%"/>
+  <p align="center"><img src="img/bymime.png" alt="By-mime view" width="80%"/><br/>
   <sub>Browsing MIME types. Red are associated with uninstalled applications, grey are not associated with anything.</sub></p>
-  <p align="center"><img src="img/byapp.png" alt="By-app view" width="80%"/>
+  <p align="center"><img src="img/byapp.png" alt="By-app view" width="80%"/><br/>
   <sub>Editing Audacity associations - with some pending removal, and some pending being added - which will happen when Ctrl-S is pressed</sub></p>
-  <p align="center"><img src="img/appadd.png" alt="Adding associations to an application" width="80%"/>
+  <p align="center"><img src="img/appadd.png" alt="Adding associations to an application" width="80%"/><br/>
   <sub>Adding multiple file associations to Audacity</sub></p>
-  <p align="center"><img src="img/confirm.png" alt="Confirmation dialogue" width="80%"/>
+  <p align="center"><img src="img/confirm.png" alt="Confirmation dialogue" width="80%"/><br/>
   <sub>Confirmation dialogue before finally approving</sub></p>
 
 ## Features
