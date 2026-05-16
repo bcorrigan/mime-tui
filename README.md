@@ -17,18 +17,14 @@ mime-tui also will surface all your broken file associations. If you are anythin
 
 Some screenshots:
 
-  <img src="img/bymime.png" alt="By-mime view" width="80%"/>
+  <p align="center"><img src="img/bymime.png" alt="By-mime view" width="80%"/></p>
   <p align="center"><sub>Browsing MIME types. Red are associated with uninstalled applications, grey are not associated with anything.</sub></p>
-  <img src="img/byapp.png" alt="By-app view" width="80%"/>
+  <p align="center"><img src="img/byapp.png" alt="By-app view" width="80%"/></p>
   <p align="center"><sub>Editing Audacity associations - with some pending removal, and some pending being added - which will happen when Ctrl-S is pressed</sub></p>
-  <img src="img/appadd.png" alt="Adding associations to an application" width="80%"/>
+  <p align="center"><img src="img/appadd.png" alt="Adding associations to an application" width="80%"/></p>
   <p align="center"><sub>Adding multiple file associations to Audacity</sub></p>
-  <img src="img/confirm.png" alt="Confirmation dialogue" width="80%"/>
+  <p align="center"><img src="img/confirm.png" alt="Confirmation dialogue" width="80%"/></p>
   <p align="center"><sub>COnfirmation dialogue before finally approving</sub></p>
-<p align="center">
-  <sub><b>Left:</b> browsing MIME types, filtered to <code>text</code> — the right pane shows the resolved default and full associations list for the selected type. &nbsp;
-  <b>Right:</b> the by-app view with the multi-toggle picker open over it</sub>
-</p>
 
 ## Features
 
