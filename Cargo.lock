@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "mime-tui"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "color-eyre",
  "crossterm",
