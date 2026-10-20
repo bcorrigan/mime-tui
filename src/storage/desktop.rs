@@ -2,10 +2,16 @@
 //! - cache PK is the desktop-file basename (e.g. `firefox.desktop`) rather
 //!   than the `Name=` field, because that is what `mimeapps.list` references;
 //! - `MimeType=` is captured as a raw semicolon-separated string;
-//! - NoDisplay / Hidden filter still applies, but OnlyShowIn / NotShowIn
-//!   filtering is intentionally relaxed — a user editing MIME associations
-//!   may legitimately want to see apps from other desktops.
+//! - only `Hidden=true` (the spec's "deleted") removes an app. `NoDisplay=true`
+//!   just means "keep out of launcher menus" — such apps (zathura plugins,
+//!   imv, ...) are still installed MIME handlers, so they are kept. OnlyShowIn
+//!   / NotShowIn filtering is likewise relaxed — a user editing MIME
+//!   associations may legitimately want to see apps from other desktops;
+//! - rows are cached per file (keyed by `source_path`) and XDG precedence is
+//!   resolved in [`load_apps`]: the earliest dir providing an id wins, and if
+//!   that file is `Hidden` the id is treated as not installed.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
@@ -24,6 +30,7 @@ pub struct ParsedDesktop {
     pub terminal: bool,
     pub raw_mime_types: String,
     pub raw_categories: String,
+    pub hidden: bool,
 }
 
 /// Refresh the cached `apps` table by walking the given directories. Uses
@@ -93,8 +100,8 @@ pub fn refresh_app_cache(conn: &mut Connection, dirs: &[String]) -> Result<()> {
             tx.execute("DELETE FROM apps WHERE source_path = ?", params![path_str])?;
             if let Some(app) = parsed {
                 tx.execute(
-                    "INSERT OR REPLACE INTO apps(id, name, exec, terminal, comment, raw_mime_types, raw_categories, source_path, file_mtime)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO apps(id, name, exec, terminal, comment, raw_mime_types, raw_categories, hidden, source_path, file_mtime)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         app.id,
                         app.name,
@@ -103,6 +110,7 @@ pub fn refresh_app_cache(conn: &mut Connection, dirs: &[String]) -> Result<()> {
                         app.comment,
                         app.raw_mime_types,
                         app.raw_categories,
+                        app.hidden as i32,
                         path_str,
                         file_mtime,
                     ],
@@ -147,34 +155,68 @@ pub fn refresh_app_cache(conn: &mut Connection, dirs: &[String]) -> Result<()> {
 /// Load all cached apps as `DesktopApp`s, with `mime_types` parsed into a
 /// trimmed list and `category` derived from `raw_categories` via
 /// [`group_category`].
-pub fn load_apps(conn: &Connection) -> Result<Vec<DesktopApp>> {
+///
+/// `dirs` must be in XDG precedence order (as from [`xdg_application_dirs`]):
+/// when several dirs provide the same id the earliest wins, and a winning
+/// `Hidden=true` file masks the id entirely. Rows from dirs no longer in
+/// `dirs` are ignored.
+pub fn load_apps(conn: &Connection, dirs: &[String]) -> Result<Vec<DesktopApp>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, exec, terminal, comment, raw_mime_types, raw_categories
+        "SELECT id, name, exec, terminal, comment, raw_mime_types, raw_categories, hidden, source_path
          FROM apps ORDER BY name COLLATE NOCASE",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, i32>(3)? != 0,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
-        ))
-    })?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i32>(3)? != 0,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i32>(7)? != 0,
+                r.get::<_, String>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let rank_of = |source_path: &str| {
+        let parent = Path::new(source_path).parent()?;
+        dirs.iter()
+            .position(|d| Path::new(d.trim_end_matches('/')) == parent)
+    };
+
+    // id -> (rank, source_path) of the highest-precedence file.
+    let mut winners: HashMap<&str, (usize, &str)> = HashMap::new();
+    for row in &rows {
+        let (id, source_path) = (row.0.as_str(), row.8.as_str());
+        let Some(rank) = rank_of(source_path) else {
+            continue;
+        };
+        match winners.get(id) {
+            Some(&(best, _)) if best <= rank => {}
+            _ => {
+                winners.insert(id, (rank, source_path));
+            }
+        }
+    }
+
     let mut out = Vec::new();
-    for r in rows {
-        let (id, name, exec, terminal, comment, raw_mime_types, raw_categories) = r?;
-        let category = group_category(&raw_categories, &name);
+    for (id, name, exec, terminal, comment, raw_mime_types, raw_categories, hidden, source_path) in
+        &rows
+    {
+        if *hidden || winners.get(id.as_str()).map(|w| w.1) != Some(source_path.as_str()) {
+            continue;
+        }
         out.push(DesktopApp {
-            id,
-            name,
-            comment,
-            exec,
-            terminal,
-            mime_types: split_semicolons(&raw_mime_types),
-            category,
+            id: id.clone(),
+            name: name.clone(),
+            comment: comment.clone(),
+            exec: exec.clone(),
+            terminal: *terminal,
+            mime_types: split_semicolons(raw_mime_types),
+            category: group_category(raw_categories, name),
         });
     }
     Ok(out)
@@ -221,8 +263,10 @@ fn mtime_secs(p: &Path) -> Option<i64> {
     Some(dur.as_secs() as i64)
 }
 
-/// Parse a single `.desktop` file. Returns `None` for entries we deliberately
-/// skip (Hidden / NoDisplay / missing required fields).
+/// Parse a single `.desktop` file. Returns `None` for entries missing required
+/// fields. `Hidden=true` entries are returned (with `hidden` set, and possibly
+/// empty name/exec) so they can mask lower-precedence copies of the same id;
+/// `NoDisplay` is deliberately ignored.
 pub fn parse_desktop_file(path: &Path) -> Option<ParsedDesktop> {
     let content = fs::read_to_string(path).ok()?;
 
@@ -232,7 +276,7 @@ pub fn parse_desktop_file(path: &Path) -> Option<ParsedDesktop> {
     let mut comment: Option<String> = None;
     let mut mime_types: Option<String> = None;
     let mut categories: Option<String> = None;
-    let mut no_display = false;
+    let mut hidden = false;
     let mut terminal = false;
     let mut in_desktop_entry = false;
 
@@ -261,24 +305,32 @@ pub fn parse_desktop_file(path: &Path) -> Option<ParsedDesktop> {
             "Comment" => comment = Some(value.to_string()),
             "MimeType" => mime_types = Some(value.to_string()),
             "Categories" => categories = Some(value.to_string()),
-            "NoDisplay" => no_display = value == "true",
-            "Hidden" => no_display = no_display || value == "true",
+            "Hidden" => hidden = value == "true",
             "Terminal" => terminal = value == "true",
             _ => {}
         }
     }
 
-    if no_display {
-        return None;
-    }
-
-    let name = name.or(generic_name)?;
-    let exec_raw = exec?;
-
     let id = path
         .file_name()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())?;
+
+    if hidden {
+        return Some(ParsedDesktop {
+            id,
+            name: name.or(generic_name).unwrap_or_default(),
+            comment: String::new(),
+            exec: String::new(),
+            terminal: false,
+            raw_mime_types: String::new(),
+            raw_categories: String::new(),
+            hidden: true,
+        });
+    }
+
+    let name = name.or(generic_name)?;
+    let exec_raw = exec?;
 
     Some(ParsedDesktop {
         id,
@@ -288,6 +340,7 @@ pub fn parse_desktop_file(path: &Path) -> Option<ParsedDesktop> {
         terminal,
         raw_mime_types: mime_types.unwrap_or_default(),
         raw_categories: categories.unwrap_or_default(),
+        hidden: false,
     })
 }
 
@@ -372,16 +425,88 @@ mod tests {
     }
 
     #[test]
-    fn skips_no_display() {
+    fn keeps_no_display() {
+        // NoDisplay only keeps an app out of menus; it's still a MIME handler
+        // (e.g. org.pwmt.zathura-pdf-mupdf.desktop) — issue #3.
         let dir = tempdir("mime_tui_parse_nodisplay");
-        let path = dir.join("hidden.desktop");
+        let path = dir.join("zathura.desktop");
         fs::write(
             &path,
-            "[Desktop Entry]\nName=Hidden\nExec=hidden\nNoDisplay=true\n",
+            "[Desktop Entry]\nName=Zathura\nExec=zathura %U\nMimeType=application/pdf;\nNoDisplay=true\n",
         )
         .unwrap();
-        assert!(parse_desktop_file(&path).is_none());
+        let p = parse_desktop_file(&path).expect("NoDisplay apps should parse");
+        assert!(!p.hidden);
+        assert_eq!(p.raw_mime_types, "application/pdf;");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hidden_parses_as_tombstone() {
+        // Hidden=true is the spec's "deleted"; it may omit Name/Exec but must
+        // still parse so it can mask lower-precedence copies.
+        let dir = tempdir("mime_tui_parse_hidden");
+        let path = dir.join("hidden.desktop");
+        fs::write(&path, "[Desktop Entry]\nHidden=true\n").unwrap();
+        let p = parse_desktop_file(&path).expect("Hidden entries should parse");
+        assert!(p.hidden);
+        assert_eq!(p.id, "hidden.desktop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn load_from(user: &Path, system: &Path) -> Vec<DesktopApp> {
+        let mut storage = crate::storage::Storage::in_memory();
+        let dirs = vec![
+            user.to_string_lossy().into_owned(),
+            system.to_string_lossy().into_owned(),
+        ];
+        refresh_app_cache(&mut storage.conn, &dirs).unwrap();
+        load_apps(&storage.conn, &dirs).unwrap()
+    }
+
+    #[test]
+    fn user_dir_overrides_system_dir() {
+        let root = tempdir("mime_tui_precedence");
+        let (user, system) = (root.join("user"), root.join("system"));
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        fs::write(
+            system.join("foo.desktop"),
+            "[Desktop Entry]\nName=System Foo\nExec=foo\n",
+        )
+        .unwrap();
+        fs::write(
+            user.join("foo.desktop"),
+            "[Desktop Entry]\nName=User Foo\nExec=foo --user\n",
+        )
+        .unwrap();
+        let apps = load_from(&user, &system);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "User Foo");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn user_hidden_masks_system_copy() {
+        let root = tempdir("mime_tui_hidden_mask");
+        let (user, system) = (root.join("user"), root.join("system"));
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        fs::write(
+            system.join("foo.desktop"),
+            "[Desktop Entry]\nName=Foo\nExec=foo\n",
+        )
+        .unwrap();
+        fs::write(
+            system.join("bar.desktop"),
+            "[Desktop Entry]\nName=Bar\nExec=bar\nNoDisplay=true\n",
+        )
+        .unwrap();
+        fs::write(user.join("foo.desktop"), "[Desktop Entry]\nHidden=true\n").unwrap();
+        let apps = load_from(&user, &system);
+        let ids: Vec<&str> = apps.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["bar.desktop"]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

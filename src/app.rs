@@ -1630,7 +1630,7 @@ fn load_world() -> Result<(Vec<DesktopApp>, Vec<MimeType>, OnDiskAssoc)> {
 
     let dirs = storage::desktop::xdg_application_dirs();
     storage::desktop::refresh_app_cache(&mut storage.conn, &dirs)?;
-    let apps = storage::desktop::load_apps(&storage.conn)?;
+    let apps = storage::desktop::load_apps(&storage.conn, &dirs)?;
 
     let assoc = storage::mimeapps::read_all();
 

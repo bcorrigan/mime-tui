@@ -11,7 +11,7 @@ pub mod desktop;
 pub mod mime_info;
 pub mod mimeapps;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub struct Storage {
     pub conn: Connection,
@@ -105,6 +105,38 @@ impl Storage {
                     file_mtime      INTEGER NOT NULL
                 );
                 CREATE INDEX apps_source ON apps(source_path);
+                CREATE TABLE scan_meta (
+                    directory       TEXT PRIMARY KEY,
+                    dir_mtime       INTEGER NOT NULL,
+                    scanned_at      INTEGER NOT NULL
+                );
+                "#,
+            )?;
+        }
+        if current < 3 {
+            // v3 keys `apps` by `source_path` rather than desktop-file id, so
+            // the same id can be cached once per XDG dir and precedence
+            // resolved at load time, and adds a `hidden` flag so a user-dir
+            // `Hidden=true` override can mask the system copy. Earlier
+            // versions also skipped `NoDisplay=true` files entirely; dropping
+            // `scan_meta` forces a one-off full rescan so they get picked up.
+            tx.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS apps;
+                DROP TABLE IF EXISTS scan_meta;
+                CREATE TABLE apps (
+                    source_path     TEXT PRIMARY KEY,
+                    id              TEXT NOT NULL,
+                    name            TEXT NOT NULL,
+                    exec            TEXT NOT NULL,
+                    terminal        INTEGER NOT NULL,
+                    comment         TEXT NOT NULL DEFAULT '',
+                    raw_mime_types  TEXT NOT NULL DEFAULT '',
+                    raw_categories  TEXT NOT NULL DEFAULT '',
+                    hidden          INTEGER NOT NULL DEFAULT 0,
+                    file_mtime      INTEGER NOT NULL
+                );
+                CREATE INDEX apps_id ON apps(id);
                 CREATE TABLE scan_meta (
                     directory       TEXT PRIMARY KEY,
                     dir_mtime       INTEGER NOT NULL,

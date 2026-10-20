@@ -118,9 +118,9 @@ fn parse_comment(path: &Path) -> Option<String> {
             Ok(Event::Eof) => return None,
             Ok(Event::Start(e)) => {
                 depth += 1;
-                if depth == 2 && e.name().as_ref() == b"comment" {
+                if depth == 2 && e.name().as_ref() == "comment" {
                     let has_lang = e.attributes().any(|a| {
-                        a.map(|a| a.key.as_ref() == b"xml:lang").unwrap_or(false)
+                        a.map(|a| a.key.as_ref() == "xml:lang").unwrap_or(false)
                     });
                     if !has_lang {
                         in_default_comment = true;
@@ -136,7 +136,7 @@ fn parse_comment(path: &Path) -> Option<String> {
             }
             Ok(Event::Text(t)) => {
                 if in_default_comment {
-                    return t.decode().ok().map(|c| c.to_string());
+                    return Some(t.xml10_content().into_owned());
                 }
             }
             _ => {}
