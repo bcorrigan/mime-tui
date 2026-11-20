@@ -61,7 +61,7 @@ You probably want to install a nerd font like `ttf-firacode-nerd` - for icons, l
 Manually - you should install rust toolchain first (get rustup) then:
 
 ```bash
-git clone https://github.com/yourname/mime-tui
+git clone https://github.com/bcorrigan/mime-tui
 cd mime-tui
 cargo build --release
 sudo cp target/release/mime-tui /usr/local/bin/
